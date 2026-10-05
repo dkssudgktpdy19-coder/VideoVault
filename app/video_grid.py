@@ -9,7 +9,7 @@ from PySide6.QtWidgets import QStyle, QStyledItemDelegate
 from app.config import THUMB_DIR
 from app.utils import fmt_duration, fmt_size, res_label
 
-CARD_W, CARD_H = 252, 214
+CARD_W, CARD_H = 252, 234
 THUMB_H = 137            # (252 - 8) * 9 / 16
 CACHE_MAX = 1500         # 메모리에 보관할 썸네일 개수
 
@@ -54,6 +54,12 @@ class VideoModel(QAbstractListModel):
             if v.get("width"):
                 lines.append(f"{v['width']}x{v['height']}  {v.get('video_codec') or ''}  "
                              f"{fmt_size(v.get('size'))}")
+            if v.get("actor_names"):
+                lines.append("👤 " + v["actor_names"])
+            if v.get("tag_names"):
+                lines.append("🏷 " + v["tag_names"])
+            if v.get("memo"):
+                lines.append("📝 " + v["memo"][:120])
             lines.append(v["full_path"] or f"연결 안 됨: {v.get('drive_name') or ''}")
             return "\n".join(lines)
         return None
@@ -171,4 +177,23 @@ class VideoDelegate(QStyledItemDelegate):
         p.setPen(QColor("#9a9a9a"))
         p.drawText(info, Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter,
                    f"▶ {v.get('play_count') or 0}회   {fmt_size(v.get('size'))}")
+
+        # 배우 / 태그 줄
+        parts = []
+        if v.get("actor_names"):
+            parts.append("👤 " + v["actor_names"])
+        if v.get("tag_names"):
+            parts.append("🏷 " + v["tag_names"])
+        f2 = QFont(font)
+        f2.setPointSize(8)
+        p.setFont(f2)
+        fm = p.fontMetrics()
+        line_rect = QRect(r.x() + 6, info.bottom() + 2, r.width() - 12, fm.height() + 2)
+        if parts:
+            p.setPen(QColor("#7fb2e5"))
+            text = fm.elidedText("   ".join(parts), Qt.TextElideMode.ElideRight, line_rect.width())
+        else:
+            p.setPen(QColor("#5a5a5a"))
+            text = "태그 없음"
+        p.drawText(line_rect, Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter, text)
         p.restore()

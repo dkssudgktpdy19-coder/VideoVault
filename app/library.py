@@ -16,8 +16,23 @@ SORTS = {
     "최근 본 순": "v.last_played DESC",
 }
 
-BASE_SQL = ("SELECT v.*, d.nickname AS drive_name FROM videos v "
-            "LEFT JOIN drives d ON d.id = v.drive_id")
+BASE_SQL = (
+    "SELECT v.*, d.nickname AS drive_name, "
+    "(SELECT GROUP_CONCAT(t.name, ', ') FROM video_tags vt JOIN tags t ON t.id = vt.tag_id "
+    " WHERE vt.video_id = v.id) AS tag_names, "
+    "(SELECT GROUP_CONCAT(a.name, ', ') FROM video_actors va JOIN actors a ON a.id = va.actor_id "
+    " WHERE va.video_id = v.id) AS actor_names "
+    "FROM videos v LEFT JOIN drives d ON d.id = v.drive_id"
+)
+
+# 검색어 한 단어: 파일명·제목·메모·태그·배우·별명 중 어디에든 있으면
+TEXT_SQL = (
+    "(v.filename LIKE ? OR IFNULL(v.title,'') LIKE ? OR IFNULL(v.memo,'') LIKE ? "
+    "OR EXISTS (SELECT 1 FROM video_tags vt JOIN tags t ON t.id = vt.tag_id "
+    "           WHERE vt.video_id = v.id AND t.name LIKE ?) "
+    "OR EXISTS (SELECT 1 FROM video_actors va JOIN actors a ON a.id = va.actor_id "
+    "           WHERE va.video_id = v.id AND (a.name LIKE ? OR IFNULL(a.aliases,'') LIKE ?)))"
+)
 
 
 def _attach_paths(conn, rows):
@@ -30,13 +45,23 @@ def _attach_paths(conn, rows):
     return rows
 
 
-def load_videos(conn, text="", sort="추가된 순 (최신)", only_new=False):
+def load_videos(conn, text="", sort="추가된 순 (최신)", only_new=False,
+                tag_ids=(), actor_ids=(), untagged=False):
     where, params = [], []
     for word in text.split():
-        where.append("(v.filename LIKE ? OR IFNULL(v.title,'') LIKE ? OR IFNULL(v.memo,'') LIKE ?)")
-        params += [f"%{word}%"] * 3
+        where.append(TEXT_SQL)
+        params += [f"%{word}%"] * 6
     if only_new:
         where.append("v.is_new = 1")
+    for tid in tag_ids:
+        where.append("v.id IN (SELECT video_id FROM video_tags WHERE tag_id = ?)")
+        params.append(tid)
+    for aid in actor_ids:
+        where.append("v.id IN (SELECT video_id FROM video_actors WHERE actor_id = ?)")
+        params.append(aid)
+    if untagged:
+        where.append("NOT EXISTS (SELECT 1 FROM video_tags WHERE video_id = v.id) "
+                     "AND NOT EXISTS (SELECT 1 FROM video_actors WHERE video_id = v.id)")
     sql = BASE_SQL
     if where:
         sql += " WHERE " + " AND ".join(where)
@@ -67,6 +92,11 @@ def clear_all_new(conn):
 
 def set_rating(conn, ids, n):
     conn.executemany("UPDATE videos SET rating = ? WHERE id = ?", [(n, i) for i in ids])
+    conn.commit()
+
+
+def update_info(conn, vid, title, memo):
+    conn.execute("UPDATE videos SET title = ?, memo = ? WHERE id = ?", (title, memo, vid))
     conn.commit()
 
 

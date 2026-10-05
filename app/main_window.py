@@ -1,16 +1,19 @@
-"""메인 화면: 썸네일 바둑판 목록"""
+"""메인 화면: 왼쪽 태그·배우 사이드바 + 썸네일 바둑판 목록"""
 import os
 import subprocess
 import time
 
-from PySide6.QtCore import QEvent, QItemSelectionModel, Qt, QThread, QTimer
+from PySide6.QtCore import QEvent, QItemSelection, QItemSelectionModel, Qt, QThread, QTimer
 from PySide6.QtGui import QAction, QGuiApplication, QKeySequence, QShortcut
-from PySide6.QtWidgets import (QAbstractItemView, QCheckBox, QComboBox, QFileDialog, QLabel,
-                               QLineEdit, QListView, QMainWindow, QMenu, QMessageBox, QToolBar)
+from PySide6.QtWidgets import (QAbstractItemView, QCheckBox, QComboBox, QDockWidget, QFileDialog,
+                               QLabel, QLineEdit, QListView, QMainWindow, QMenu, QMessageBox,
+                               QToolBar)
 
-from app import library, scanner
+from app import library, scanner, tags
 from app.db import init_db
+from app.edit_dialog import EditDialog
 from app.player import PlayerWindow
+from app.sidebar import Sidebar
 from app.video_grid import VideoDelegate, VideoModel
 
 AUTO_CHECK_GAP = 60   # 창으로 돌아왔을 때 자동 확인 최소 간격(초)
@@ -40,8 +43,9 @@ class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("VideoVault")
-        self.resize(1400, 900)
+        self.resize(1500, 920)
         self.conn = init_db()
+        tags.ensure_indexes(self.conn)
         self.scan_thread = None
         self._total_before = 0
         self._sig_before = None
@@ -67,24 +71,43 @@ class MainWindow(QMainWindow):
         self.view.customContextMenuRequested.connect(self.show_menu)
         self.setCentralWidget(self.view)
 
-        # 숫자키 0~5 = 별점 (목록에 포커스가 있을 때만)
+        # 목록 단축키: 숫자키 0~5 = 별점, E = 편집
         for n in range(6):
             sc = QShortcut(QKeySequence(str(n)), self.view)
             sc.setContext(Qt.ShortcutContext.WidgetShortcut)
             sc.activated.connect(lambda n=n: self.set_rating(n))
+        sc_edit = QShortcut(QKeySequence("E"), self.view)
+        sc_edit.setContext(Qt.ShortcutContext.WidgetShortcut)
+        sc_edit.activated.connect(self.edit_selected)
 
-        # 재생 창
+        # 재생 창 (T = 보고 있는 영상 편집)
         self.player = PlayerWindow(self.conn)
         self.player.video_changed.connect(self.refresh_video)
         self.player.next_provider = self.neighbor_video
+        sc_t = QShortcut(QKeySequence("T"), self.player)
+        sc_t.setContext(Qt.ShortcutContext.WindowShortcut)
+        sc_t.activated.connect(self.edit_playing)
 
         # 검색 지연 타이머
         self.search_timer = QTimer(self)
         self.search_timer.setSingleShot(True)
         self.search_timer.setInterval(250)
-        self.search_timer.timeout.connect(self.reload)
+        self.search_timer.timeout.connect(lambda: self.reload(keep=False))
 
         self._build_toolbar()
+
+        # 왼쪽 사이드바
+        self.sidebar = Sidebar(self.conn)
+        self.sidebar.filters_changed.connect(lambda: self.reload(keep=False))
+        self.sidebar.data_edited.connect(self.after_edit)
+        dock = QDockWidget("정리", self)
+        dock.setObjectName("sidebar")
+        dock.setWidget(self.sidebar)
+        dock.setFeatures(QDockWidget.DockWidgetFeature.NoDockWidgetFeatures)
+        self.addDockWidget(Qt.DockWidgetArea.LeftDockWidgetArea, dock)
+        self.resizeDocks([dock], [250], Qt.Orientation.Horizontal)
+
+        # 상태 표시줄
         self.status = QLabel()
         self.statusBar().addWidget(self.status, 1)
         self.scan_label = QLabel()
@@ -100,13 +123,15 @@ class MainWindow(QMainWindow):
         self.audio_timer.start()
         self.update_audio()
 
-        self.reload()
+        self.reload(keep=False)
         # 요구사항 5번: 시작하면 새 영상 자동 확인
         QTimer.singleShot(800, lambda: self.rescan_all(quiet=True))
 
     # ---------- 도구 막대 ----------
-    def _action(self, tb, text, fn):
+    def _action(self, tb, text, fn, tip=""):
         a = QAction(text, self)
+        if tip:
+            a.setToolTip(tip)
         a.triggered.connect(lambda checked=False: fn())
         tb.addAction(a)
 
@@ -117,33 +142,47 @@ class MainWindow(QMainWindow):
         self._action(tb, "📁 폴더 추가", self.add_folder)
         self._action(tb, "📂 등록 폴더", self.show_folders)
         self._action(tb, "🔄 새 영상 확인", self.rescan_all)
+        self._action(tb, "🏷 자동 태그", lambda: self.auto_tag(False),
+                     "만들어 둔 태그·배우 이름이 파일명·폴더명에 들어 있는 영상에 한 번에 붙이기")
         tb.addSeparator()
 
         self.search = QLineEdit()
-        self.search.setPlaceholderText("🔍 제목 검색 (띄어쓰기로 여러 단어)")
+        self.search.setPlaceholderText("🔍 검색: 제목·태그·배우·메모 (띄어쓰기로 여러 단어)")
         self.search.setClearButtonEnabled(True)
-        self.search.setFixedWidth(320)
+        self.search.setFixedWidth(340)
         self.search.textChanged.connect(lambda _: self.search_timer.start())
         tb.addWidget(self.search)
 
         tb.addWidget(QLabel("   정렬 "))
         self.sort = QComboBox()
         self.sort.addItems(list(library.SORTS))
-        self.sort.currentIndexChanged.connect(lambda _: self.reload())
+        self.sort.currentIndexChanged.connect(lambda _: self.reload(keep=False))
         tb.addWidget(self.sort)
 
         tb.addWidget(QLabel("  "))
         self.chk_new = QCheckBox("NEW만 보기")
-        self.chk_new.toggled.connect(lambda _: self.reload())
+        self.chk_new.toggled.connect(lambda _: self.reload(keep=False))
         tb.addWidget(self.chk_new)
         tb.addSeparator()
         self._action(tb, "✔ NEW 모두 지우기", self.clear_all_new)
 
     # ---------- 목록 ----------
-    def reload(self):
-        rows = library.load_videos(self.conn, self.search.text(),
-                                   self.sort.currentText(), self.chk_new.isChecked())
+    def reload(self, keep=True):
+        """keep=True면 스크롤 위치와 선택을 유지"""
+        sb = self.view.verticalScrollBar()
+        pos = sb.value() if keep else 0
+        keep_ids = {v["id"] for v in self.selected_videos()} if keep else set()
+        rows = library.load_videos(self.conn, self.search.text(), self.sort.currentText(),
+                                   self.chk_new.isChecked(), **self.sidebar.filters())
         self.model.set_rows(rows)
+        if keep_ids:
+            sel = QItemSelection()
+            for i, v in enumerate(rows):
+                if v["id"] in keep_ids:
+                    idx = self.model.index(i)
+                    sel.select(idx, idx)
+            self.view.selectionModel().select(sel, QItemSelectionModel.SelectionFlag.ClearAndSelect)
+        QTimer.singleShot(0, lambda: sb.setValue(pos))
         self.update_status()
 
     def update_status(self):
@@ -151,8 +190,10 @@ class MainWindow(QMainWindow):
         n_folders = len(library.get_setting(self.conn, "folders", []))
         folder_txt = (f"등록 폴더 {n_folders}개" if n_folders
                       else "⚠ 등록 폴더 없음 → '📁 폴더 추가'를 해야 새 영상이 자동 확인됩니다")
+        summary = self.sidebar.summary()
+        filt = f"   |   필터: {summary}" if summary else ""
         self.status.setText(f"표시 {len(self.model.rows)}개 / 전체 {total}개   |   NEW {new}개   |   "
-                            f"{folder_txt}   |   더블클릭: 재생   숫자키 0~5: 별점   우클릭: 메뉴")
+                            f"{folder_txt}{filt}   |   더블클릭: 재생 · E: 태그 편집 · 0~5: 별점")
 
     def update_audio(self):
         self.audio_label.setText(self.player.refresh_audio_label())
@@ -200,6 +241,58 @@ class MainWindow(QMainWindow):
         if not self.player.open_video(v):
             QMessageBox.information(self, "재생할 수 없음", f"파일을 열 수 없습니다:\n{v['full_path']}")
 
+    # ---------- 편집 / 태그 ----------
+    def edit_selected(self):
+        vids = self.selected_videos()
+        if vids:
+            self.edit_videos(vids, self)
+
+    def edit_playing(self):
+        if self.player.video:
+            fresh = library.get_video(self.conn, self.player.video["id"])
+            if fresh:
+                self.edit_videos([fresh], self.player)
+
+    def edit_videos(self, vids, parent):
+        dlg = EditDialog(self.conn, vids, parent)
+        if dlg.exec():
+            self.after_edit()
+
+    def after_edit(self):
+        self.sidebar.refresh()
+        self.reload(keep=True)
+
+    def auto_tag(self, selected_only=False):
+        if not tags.has_dictionary(self.conn):
+            QMessageBox.information(
+                self, "자동 태그",
+                "먼저 왼쪽 사이드바에서 태그나 배우를 만들어 주세요.\n\n"
+                "파일 이름이나 폴더 이름에 그 이름이 들어 있는 영상에 자동으로 붙여 줍니다.\n"
+                "예) 배우 '원이'를 만들면 → 파일명에 '원이'가 있는 영상에 붙음")
+            return
+        ids = [v["id"] for v in self.selected_videos()] if selected_only else None
+        target = f"선택한 영상 {len(ids)}개" if selected_only else "전체 영상"
+        plan = tags.plan_auto_tag(self.conn, ids)
+        if not plan:
+            QMessageBox.information(self, "자동 태그", f"{target}에서 새로 붙일 태그·배우가 없습니다.")
+            return
+        n_tag = sum(len(p["tag"]) for p in plan)
+        n_actor = sum(len(p["actor"]) for p in plan)
+        lines = []
+        for p in plan:
+            parts = [f"👤{n}" for n in p["actor"]] + [f"🏷{n}" for n in p["tag"]]
+            lines.append(f"{scanner.safe_text(p['filename'])}\n    → {'  '.join(parts)}")
+        box = QMessageBox(self)
+        box.setWindowTitle("파일명으로 자동 태그")
+        box.setText(f"{target} 중 {len(plan)}개 영상에\n태그 {n_tag}개, 배우 {n_actor}개를 붙입니다.\n\n"
+                    "아래 'Show Details...' 버튼을 누르면 전체 목록을 볼 수 있습니다.\n붙일까요?")
+        box.setDetailedText("\n".join(lines))
+        box.setStandardButtons(QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
+        box.exec()
+        if box.standardButton(box.clickedButton()) == QMessageBox.StandardButton.Yes:
+            tags.apply_plan(self.conn, plan)
+            self.after_edit()
+
     # ---------- 별점 / NEW ----------
     def set_rating(self, n):
         vids = self.selected_videos()
@@ -238,6 +331,8 @@ class MainWindow(QMainWindow):
         menu = QMenu(self)
         _menu_item(menu, "▶ 재생", lambda: self.play_video(v))
         menu.addSeparator()
+        _menu_item(menu, f"✏ 정보·태그 편집 ({count}개)    E", self.edit_selected)
+        _menu_item(menu, f"🏷 파일명으로 자동 태그 ({count}개)", lambda: self.auto_tag(True))
         rate = menu.addMenu(f"★ 별점 매기기 ({count}개)")
         for n in range(5, -1, -1):
             _menu_item(rate, "★" * n if n else "별점 지우기", lambda n=n: self.set_rating(n))
@@ -292,7 +387,8 @@ class MainWindow(QMainWindow):
         """목록이 바뀌었는지 비교하기 위한 요약값"""
         return tuple(self.conn.execute(
             "SELECT COUNT(*), IFNULL(MAX(id),0), IFNULL(SUM(is_missing),0), "
-            "IFNULL(SUM(thumb_path IS NOT NULL),0), IFNULL(SUM(LENGTH(rel_path)),0) FROM videos"
+            "IFNULL(SUM(thumb_path IS NOT NULL AND thumb_path != ''),0), "
+            "IFNULL(SUM(LENGTH(rel_path)),0) FROM videos"
         ).fetchone())
 
     def start_scan(self, paths, offline=0, quiet=False):
@@ -315,11 +411,13 @@ class MainWindow(QMainWindow):
         added = library.counts(self.conn)[0] - self._total_before
         self.scan_label.setText(f"✅ 확인 완료 · 새 영상 {added}개")
         if self._signature() != self._sig_before:
-            self.reload()          # 바뀐 게 있을 때만 목록 새로고침
+            self.reload(keep=True)     # 스크롤·선택 유지한 채 새로고침
         QTimer.singleShot(8000, lambda: self.scan_label.setText(""))
 
     def changeEvent(self, e):
         """다른 창에 있다가 이 창으로 돌아오면 새 영상 자동 확인"""
+        if getattr(self, "_closing", False):
+            return
         super().changeEvent(e)
         if e.type() == QEvent.Type.ActivationChange and self.isActiveWindow():
             if time.time() - self._last_scan > AUTO_CHECK_GAP:
@@ -327,6 +425,7 @@ class MainWindow(QMainWindow):
 
     # ---------- 종료 ----------
     def closeEvent(self, event):
+        self._closing = True
         self.audio_timer.stop()
         self.player.shutdown()
         scanning = self.scan_thread is not None and self.scan_thread.isRunning()
