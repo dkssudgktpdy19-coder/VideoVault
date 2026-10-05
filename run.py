@@ -76,6 +76,10 @@ def main():
     from app import backup, thumb_tool
     backup.install(window)
     thumb_tool.install(window)
+    from app import marks, presets
+    marks.install(window)
+    presets.install(window)
+
 
     window.show()
     sys.exit(app.exec())
