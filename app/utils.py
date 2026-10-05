@@ -18,3 +18,19 @@ def fmt_size(n):
         if n < 1024 or unit == "TB":
             return f"{n} B" if unit == "B" else f"{n:.1f} {unit}"
         n /= 1024
+
+
+def res_label(w, h):
+    """해상도 배지. 세로 영상도 맞게 나오도록 긴 쪽 기준"""
+    if not w or not h:
+        return ""
+    long_side = max(w, h)
+    if long_side >= 3800:
+        return "4K"
+    if long_side >= 2500:
+        return "2K"
+    if long_side >= 1900:
+        return "FHD"
+    if long_side >= 1200:
+        return "HD"
+    return "SD"

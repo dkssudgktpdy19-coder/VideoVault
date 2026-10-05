@@ -1,0 +1,126 @@
+"""화면에서 쓰는 DB 읽기/쓰기"""
+import json
+import os
+from datetime import datetime
+
+from app.drives import connected_drives, drive_letters, volume_info
+
+SORTS = {
+    "추가된 순 (최신)": "v.id DESC",
+    "이름순": "v.filename COLLATE NOCASE ASC",
+    "길이 긴 순": "v.duration DESC",
+    "길이 짧은 순": "v.duration ASC",
+    "용량 큰 순": "v.size DESC",
+    "별점 높은 순": "v.rating DESC, v.id DESC",
+    "많이 본 순": "v.play_count DESC, v.id DESC",
+    "최근 본 순": "v.last_played DESC",
+}
+
+BASE_SQL = ("SELECT v.*, d.nickname AS drive_name FROM videos v "
+            "LEFT JOIN drives d ON d.id = v.drive_id")
+
+
+def _attach_paths(conn, rows):
+    """지금 연결된 드라이브 문자로 실제 경로를 붙임"""
+    letters = drive_letters(conn)
+    for r in rows:
+        letter = letters.get(r["drive_id"])
+        r["full_path"] = os.path.join(letter + "\\", r["rel_path"]) if letter else None
+        r["online"] = bool(letter) and not r["is_missing"]
+    return rows
+
+
+def load_videos(conn, text="", sort="추가된 순 (최신)", only_new=False):
+    where, params = [], []
+    for word in text.split():
+        where.append("(v.filename LIKE ? OR IFNULL(v.title,'') LIKE ? OR IFNULL(v.memo,'') LIKE ?)")
+        params += [f"%{word}%"] * 3
+    if only_new:
+        where.append("v.is_new = 1")
+    sql = BASE_SQL
+    if where:
+        sql += " WHERE " + " AND ".join(where)
+    sql += " ORDER BY " + SORTS.get(sort, "v.id DESC")
+    rows = [dict(r) for r in conn.execute(sql, params)]
+    return _attach_paths(conn, rows)
+
+
+def get_video(conn, vid):
+    rows = [dict(r) for r in conn.execute(BASE_SQL + " WHERE v.id = ?", (vid,))]
+    return _attach_paths(conn, rows)[0] if rows else None
+
+
+def counts(conn):
+    r = conn.execute("SELECT COUNT(*), IFNULL(SUM(is_new), 0) FROM videos").fetchone()
+    return r[0], r[1]
+
+
+def clear_new(conn, ids):
+    conn.executemany("UPDATE videos SET is_new = 0 WHERE id = ?", [(i,) for i in ids])
+    conn.commit()
+
+
+def clear_all_new(conn):
+    conn.execute("UPDATE videos SET is_new = 0")
+    conn.commit()
+
+
+def set_rating(conn, ids, n):
+    conn.executemany("UPDATE videos SET rating = ? WHERE id = ?", [(n, i) for i in ids])
+    conn.commit()
+
+
+def mark_played(conn, vid):
+    now = datetime.now().isoformat(timespec="seconds")
+    conn.execute("UPDATE videos SET play_count = play_count + 1, last_played = ?, is_new = 0 "
+                 "WHERE id = ?", (now, vid))
+    conn.commit()
+
+
+def save_resume(conn, vid, pos, dur):
+    """이어보기 위치 저장. 처음 10초 이내나 거의 끝까지 봤으면 0으로"""
+    if pos is None:
+        return
+    if pos < 10 or (dur and pos > dur - 20):
+        pos = 0
+    conn.execute("UPDATE videos SET resume_pos = ? WHERE id = ?", (round(pos, 1), vid))
+    conn.commit()
+
+
+# ---------- 설정 ----------
+def get_setting(conn, key, default=None):
+    row = conn.execute("SELECT value FROM settings WHERE key = ?", (key,)).fetchone()
+    return json.loads(row["value"]) if row else default
+
+
+def set_setting(conn, key, value):
+    conn.execute("INSERT INTO settings (key, value) VALUES (?, ?) "
+                 "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                 (key, json.dumps(value, ensure_ascii=False)))
+    conn.commit()
+
+
+# ---------- 등록 폴더 (드라이브 문자가 바뀌어도 찾을 수 있게 시리얼로 저장) ----------
+def add_folder(conn, path):
+    path = os.path.abspath(path)
+    letter = os.path.splitdrive(path)[0].upper()
+    serial, _ = volume_info(letter + "\\")
+    prefix = os.path.relpath(path, letter + "\\")
+    item = {"serial": serial, "prefix": "" if prefix == "." else prefix}
+    folders = get_setting(conn, "folders", [])
+    if item not in folders:
+        folders.append(item)
+        set_setting(conn, "folders", folders)
+
+
+def folder_paths(conn):
+    """등록 폴더 중 지금 연결된 것의 실제 경로, 연결 안 된 개수"""
+    now = connected_drives()
+    paths, offline = [], 0
+    for f in get_setting(conn, "folders", []):
+        letter = now.get(f["serial"])
+        if letter:
+            paths.append(os.path.join(letter + "\\", f["prefix"]))
+        else:
+            offline += 1
+    return paths, offline
