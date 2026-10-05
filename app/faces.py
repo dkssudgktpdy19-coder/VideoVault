@@ -22,7 +22,7 @@ from app import config
 DET_THRESH = 0.60      # 얼굴로 인정할 최소 확신도
 MIN_FACE = 40          # 이보다 작은 얼굴(픽셀)은 무시
 SAME_IN_VIDEO = 0.50   # 한 영상 안에서 같은 사람으로 볼 유사도
-SAME_PERSON = 0.40     # 영상끼리 같은 사람으로 묶을 유사도 (섞이면 ↑, 쪼개지면 ↓)
+SAME_PERSON = 0.45     # 영상끼리 같은 사람으로 묶을 유사도 (섞이면 ↑, 쪼개지면 ↓)
 MIN_FRAMES, MAX_FRAMES, SEC_PER_FRAME = 6, 20, 30
 GRAB_WORKERS = 4
 DET_SIZE = 640
@@ -190,10 +190,7 @@ def probe_duration(path):
         return 0.0
 
 
-def grab(path, t, maxw=1280):
-    cmd = [FFMPEG, "-hide_banner", "-loglevel", "error", "-ss", f"{t:.2f}", "-i", path,
-           "-an", "-sn", "-frames:v", "1", "-vf", f"scale='min({maxw},iw)':-2",
-           "-f", "image2pipe", "-c:v", "bmp", "-"]
+def _run_grab(cmd):
     try:
         r = subprocess.run(cmd, capture_output=True, timeout=60, creationflags=NO_WINDOW)
     except Exception:
@@ -201,6 +198,17 @@ def grab(path, t, maxw=1280):
     if not r.stdout:
         return None
     return cv2.imdecode(np.frombuffer(r.stdout, np.uint8), cv2.IMREAD_COLOR)
+
+
+def grab(path, t, maxw=1280):
+    """키프레임만 읽어서 빠르게 (실패하면 정확한 방식으로 다시)"""
+    head = [FFMPEG, "-hide_banner", "-loglevel", "error"]
+    tail = ["-i", path, "-an", "-sn", "-frames:v", "1", "-vf", f"scale='min({maxw},iw)':-2",
+            "-f", "image2pipe", "-c:v", "bmp", "-"]
+    img = _run_grab(head + ["-skip_frame", "nokey", "-noaccurate_seek", "-ss", f"{t:.2f}"] + tail)
+    if img is None:
+        img = _run_grab(head + ["-ss", f"{t:.2f}"] + tail)
+    return img
 
 
 def sample_times(dur):

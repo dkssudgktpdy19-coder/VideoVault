@@ -79,6 +79,9 @@ def main():
     from app import marks, presets
     marks.install(window)
     presets.install(window)
+    from app import face_ui
+    face_ui.install(window)
+
 
 
     window.show()
