@@ -6,6 +6,13 @@ import sys
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 os.environ["PATH"] = BASE_DIR + os.pathsep + os.environ.get("PATH", "")   # libmpv-2.dll 위치
 
+# 깨진 글자가 있어도 출력하다 멈추지 않게
+for _stream in (sys.stdout, sys.stderr):
+    try:
+        _stream.reconfigure(errors="replace")
+    except Exception:
+        pass
+
 from PySide6.QtGui import QColor, QPalette
 from PySide6.QtWidgets import QApplication
 

@@ -76,6 +76,7 @@ class MainWindow(QMainWindow):
         # 재생 창
         self.player = PlayerWindow(self.conn)
         self.player.video_changed.connect(self.refresh_video)
+        self.player.next_provider = self.neighbor_video
 
         # 검색 지연 타이머
         self.search_timer = QTimer(self)
@@ -88,6 +89,16 @@ class MainWindow(QMainWindow):
         self.statusBar().addWidget(self.status, 1)
         self.scan_label = QLabel()
         self.statusBar().addPermanentWidget(self.scan_label)
+        self.audio_label = QLabel()
+        self.audio_label.setStyleSheet("color:#9ad; padding-right:6px;")
+        self.statusBar().addPermanentWidget(self.audio_label)
+
+        # 요구사항 14번: 현재 사운드 출력 장치 표시 (5초마다 갱신)
+        self.audio_timer = QTimer(self)
+        self.audio_timer.setInterval(5000)
+        self.audio_timer.timeout.connect(self.update_audio)
+        self.audio_timer.start()
+        self.update_audio()
 
         self.reload()
         # 요구사항 5번: 시작하면 새 영상 자동 확인
@@ -143,11 +154,36 @@ class MainWindow(QMainWindow):
         self.status.setText(f"표시 {len(self.model.rows)}개 / 전체 {total}개   |   NEW {new}개   |   "
                             f"{folder_txt}   |   더블클릭: 재생   숫자키 0~5: 별점   우클릭: 메뉴")
 
+    def update_audio(self):
+        self.audio_label.setText(self.player.refresh_audio_label())
+
     def refresh_video(self, vid):
         fresh = library.get_video(self.conn, vid)
         if fresh:
             self.model.update_video(fresh)
         self.update_status()
+        # 재생 중인 영상을 목록에서 선택해 둠
+        if self.player.video and self.player.video["id"] == vid:
+            for i, v in enumerate(self.model.rows):
+                if v["id"] == vid:
+                    idx = self.model.index(i)
+                    self.view.selectionModel().setCurrentIndex(
+                        idx, QItemSelectionModel.SelectionFlag.ClearAndSelect)
+                    self.view.scrollTo(idx)
+                    break
+
+    def neighbor_video(self, vid, step):
+        """지금 보이는 목록 순서에서 앞(-1)/뒤(+1)의 재생 가능한 영상"""
+        rows = self.model.rows
+        idx = next((i for i, v in enumerate(rows) if v["id"] == vid), None)
+        if idx is None:
+            return None
+        i = idx + step
+        while 0 <= i < len(rows):
+            if rows[i]["online"]:
+                return rows[i]
+            i += step
+        return None
 
     def selected_videos(self):
         return [self.model.rows[i.row()] for i in self.view.selectionModel().selectedIndexes()]
@@ -291,6 +327,7 @@ class MainWindow(QMainWindow):
 
     # ---------- 종료 ----------
     def closeEvent(self, event):
+        self.audio_timer.stop()
         self.player.shutdown()
         scanning = self.scan_thread is not None and self.scan_thread.isRunning()
         self.conn.close()
