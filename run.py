@@ -73,6 +73,10 @@ def main():
     apply_dark_theme(app)
     window = MainWindow()
     quick_exit.install(window)
+    from app import backup, thumb_tool
+    backup.install(window)
+    thumb_tool.install(window)
+
     window.show()
     sys.exit(app.exec())
 
