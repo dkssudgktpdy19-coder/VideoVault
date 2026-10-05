@@ -67,16 +67,38 @@ def probe(path):
     }
 
 
-def make_thumb(path, out_path, time_sec, width=320):
-    """time_sec 지점 장면을 jpg로 저장. 실패하면 맨 앞 장면으로 다시 시도"""
+def _grab(path, out_path, t, width, accurate, video_only):
+    """장면 하나를 jpg로 저장. accurate=True면 느리지만 특이한 파일에도 잘 됨"""
+    seek = ["-ss", f"{t:.2f}"]
+    src = ["-i", str(path)]
+    cmd = ["ffmpeg", "-y", "-v", "error"]
+    cmd += (src + seek) if accurate else (seek + src)
+    if video_only:
+        cmd += ["-map", "0:V:0"]          # 앨범 표지 같은 그림은 빼고 진짜 영상만
+    cmd += ["-an", "-sn", "-dn", "-frames:v", "1",
+            "-vf", f"scale={width}:-2", "-q:v", "4", out_path]
+    try:
+        _run(cmd, 120 if accurate else 60)
+    except (subprocess.TimeoutExpired, OSError):
+        return False
+    return os.path.exists(out_path) and os.path.getsize(out_path) > 0
+
+
+def make_thumb(path, out_path, time_sec, width=320, duration=None):
+    """여러 방법을 차례로 시도해서 하나라도 성공하면 True"""
     out_path = str(out_path)
-    for t in dict.fromkeys((time_sec, 0)):
-        cmd = ["ffmpeg", "-y", "-v", "error", "-ss", f"{t:.2f}", "-i", str(path),
-               "-frames:v", "1", "-vf", f"scale={width}:-2", "-q:v", "4", out_path]
+    times = [time_sec]
+    if duration and duration > 4:
+        times.append(duration * 0.5)
+    times.append(0)
+    tries = [(t, False, True) for t in dict.fromkeys(round(x, 2) for x in times)]
+    tries.append((min(time_sec, 3.0), True, True))   # 정확한 방식
+    tries.append((0, False, False))                  # 앨범 표지라도 사용
+    for t, accurate, video_only in tries:
         try:
-            _run(cmd, 90)
-        except (subprocess.TimeoutExpired, OSError):
-            continue
-        if os.path.exists(out_path) and os.path.getsize(out_path) > 0:
+            os.remove(out_path)
+        except OSError:
+            pass
+        if _grab(path, out_path, t, width, accurate, video_only):
             return True
     return False

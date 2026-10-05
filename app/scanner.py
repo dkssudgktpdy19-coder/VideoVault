@@ -102,14 +102,15 @@ def _thumb_job(vid, full, duration):
     else:
         t = 0
     name = f"{vid}.jpg"
-    ok = media.make_thumb(full, THUMB_DIR / name, t)
+    ok = media.make_thumb(full, THUMB_DIR / name, t, duration=duration)
     return vid, (name if ok else None), t
 
 
 def make_thumbnails(conn, drive_id, root, prefix):
+    # thumb_path 값:  NULL = 아직 안 만듦  /  '' = 만들기 실패 (다시 시도 안 함)
     rows = conn.execute("SELECT id, rel_path, duration, thumb_path FROM videos "
                         "WHERE drive_id=? AND is_missing=0 AND thumb_custom=0", (drive_id,)).fetchall()
-    jobs = [r for r in rows if r["rel_path"].startswith(prefix)
+    jobs = [r for r in rows if r["rel_path"].startswith(prefix) and r["thumb_path"] != ""
             and not (r["thumb_path"] and (THUMB_DIR / r["thumb_path"]).exists())]
     if not jobs:
         print("      새로 만들 썸네일 없음")
@@ -123,13 +124,15 @@ def make_thumbnails(conn, drive_id, root, prefix):
                 vid, name, t = fut.result()
             except Exception:
                 fail += 1
+                _progress(i, len(jobs))
                 continue
             if name:
                 conn.execute("UPDATE videos SET thumb_path=?, thumb_time=? WHERE id=?", (name, t, vid))
-                conn.commit()          # 바로 저장 (DB 잠금 시간 최소화)
                 ok += 1
             else:
+                conn.execute("UPDATE videos SET thumb_path='' WHERE id=?", (vid,))
                 fail += 1
+            conn.commit()          # 바로 저장 (DB 잠금 시간 최소화)
             _progress(i, len(jobs))
     return ok, fail
 
@@ -193,7 +196,7 @@ def scan_folder(folder):
                 try:
                     key, info = fut.result()
                     stats[_save(conn, letters, drive_id, rel, size, mtime, key, info)] += 1
-                    conn.commit()      # 하나 끝날 때마다 바로 저장 (DB 잠금 시간 최소화)
+                    conn.commit()      # 하나 끝날 때마다 바로 저장
                 except Exception as e:
                     conn.rollback()
                     stats["error"] += 1
@@ -222,6 +225,9 @@ def scan_folder(folder):
           f"내용 변경: {stats['updated']}개 | 사라짐: {missing}개 | 오류: {stats['error']}개 | "
           f"건너뜀: {len(skipped)}개")
     print(f"썸네일 생성: {t_ok}개 | 썸네일 실패: {t_fail}개")
+    if t_fail:
+        print("      → 실패한 영상은 다음 스캔부터 다시 시도하지 않습니다. "
+              "목록 보기: python -m app.scanner --nothumb")
     print(f"걸린 시간: {time.time() - t0:.1f}초")
 
 
@@ -235,8 +241,33 @@ def list_videos(limit=20):
         thumb = "O" if r["thumb_path"] else "X"
         lost = " (못 찾음)" if r["is_missing"] else ""
         print(f"{badge} {fmt_duration(r['duration']):>8}  {res:>6}  {fmt_size(r['size']):>9}  "
-              f"썸네일:{thumb}  {r['filename']}{lost}")
+              f"썸네일:{thumb}  {safe_text(r['filename'])}{lost}")
     conn.close()
+
+
+def list_no_thumb():
+    """썸네일이 없는 영상 목록 (원인 확인용)"""
+    conn = init_db()
+    rows = conn.execute("SELECT filename, duration, video_codec, width, height, size, thumb_path "
+                        "FROM videos WHERE (thumb_path IS NULL OR thumb_path='') AND is_missing=0"
+                        ).fetchall()
+    print(f"썸네일 없는 영상 {len(rows)}개\n")
+    for r in rows:
+        state = "실패" if r["thumb_path"] == "" else "대기"
+        codec = r["video_codec"] or "영상없음"
+        res = f"{r['width']}x{r['height']}" if r["width"] else "-"
+        print(f"[{state}] {fmt_duration(r['duration']):>8}  {codec:>8}  {res:>10}  "
+              f"{fmt_size(r['size']):>9}  {safe_text(r['filename'])}")
+    conn.close()
+
+
+def retry_thumbs():
+    """실패로 표시된 썸네일을 다음 스캔 때 다시 시도하게"""
+    conn = init_db()
+    n = conn.execute("UPDATE videos SET thumb_path=NULL WHERE thumb_path=''").rowcount
+    conn.commit()
+    conn.close()
+    print(f"{n}개를 다시 시도하도록 표시했습니다. 프로그램에서 '🔄 새 영상 확인'을 누르세요.")
 
 
 if __name__ == "__main__":
@@ -246,8 +277,15 @@ if __name__ == "__main__":
         except Exception:
             pass
     if len(sys.argv) < 2:
-        print('사용법:  python -m app.scanner "E:\\영상폴더"   또는   python -m app.scanner --list')
+        print('사용법:  python -m app.scanner "E:\\영상폴더"\n'
+              '        python -m app.scanner --list          (최근 영상 목록)\n'
+              '        python -m app.scanner --nothumb       (썸네일 없는 영상)\n'
+              '        python -m app.scanner --retry-thumbs  (실패한 썸네일 다시 시도)')
     elif sys.argv[1] == "--list":
         list_videos()
+    elif sys.argv[1] == "--nothumb":
+        list_no_thumb()
+    elif sys.argv[1] == "--retry-thumbs":
+        retry_thumbs()
     else:
         scan_folder(" ".join(sys.argv[1:]))
