@@ -91,6 +91,9 @@ def main():
     manage.install(window)
     from app import folders
     folders.install(window)
+    from app import actor_ui
+    actor_ui.install(window)
+
 
 
 

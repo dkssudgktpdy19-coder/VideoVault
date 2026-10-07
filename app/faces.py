@@ -304,7 +304,9 @@ def find_videos(conn, folder):
     cols = {r[1] for r in conn.execute("PRAGMA table_info(videos)")}
     dcol = "duration" if "duration" in cols else "0"
     by_name = {}
-    for vid, rel, dur in conn.execute(f"SELECT id, rel_path, {dcol} FROM videos"):
+    ex = " WHERE IFNULL(excluded, 0) = 0" if "excluded" in cols else ""
+    for vid, rel, dur in conn.execute(f"SELECT id, rel_path, {dcol} FROM videos{ex}"):
+
         if rel:
             key = os.path.normcase(os.path.normpath(rel)).lstrip("\\/")
             by_name.setdefault(os.path.basename(key), []).append((key, vid, dur or 0))

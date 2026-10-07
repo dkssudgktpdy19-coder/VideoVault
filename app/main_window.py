@@ -353,6 +353,10 @@ class MainWindow(QMainWindow):
             _menu_item(menu, "📋 파일 경로 복사",
                        lambda: QGuiApplication.clipboard().setText(path))
 
+        am = getattr(self, "_vv_actor_menu", None)
+        if am is not None:
+            am(menu, self.selected_videos())
+
         ex = getattr(self, "_vv_exclude", None)
         if ex is not None:
             menu.addSeparator()

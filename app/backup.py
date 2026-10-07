@@ -18,6 +18,7 @@ DATA_DIR = Path(config.DATA_DIR)
 BACKUP_DIR = Path(getattr(config, "BACKUP_DIR", DATA_DIR / "backups"))
 THUMB_DIR = Path(getattr(config, "THUMB_DIR", DATA_DIR / "thumbs"))
 SUB_DIR = Path(getattr(config, "SUB_DIR", DATA_DIR / "subs"))
+ACTOR_DIR = DATA_DIR / "actors"
 KEEP = int(getattr(config, "BACKUP_KEEP", 7))
 STATE_FILE = DATA_DIR / "backup_state.json"
 AUTO_GAP = 20 * 3600            # 마지막 자동 백업 후 20시간 지나면 다시
@@ -94,6 +95,9 @@ def make_backup(conn, kind="manual"):
                 z.write(f, "custom_thumbs/" + f.name)
             for f in SUB_DIR.glob("*.srt"):
                 z.write(f, "subs/" + f.name)
+            for f in ACTOR_DIR.glob("*.jpg"):
+                z.write(f, "actor_photos/" + f.name)
+
 
             z.writestr("info.json", json.dumps(
                 {"created": stamp, "kind": kind, "summary": summary},
@@ -146,6 +150,10 @@ def restore(conn, zip_path, db):
             elif n.startswith("subs/") and not n.endswith("/"):
                 SUB_DIR.mkdir(parents=True, exist_ok=True)
                 (SUB_DIR / Path(n).name).write_bytes(z.read(n))
+            elif n.startswith("actor_photos/") and not n.endswith("/"):
+                ACTOR_DIR.mkdir(parents=True, exist_ok=True)
+                (ACTOR_DIR / Path(n).name).write_bytes(z.read(n))
+
 
     shutil.rmtree(db.parent, ignore_errors=True)
 
