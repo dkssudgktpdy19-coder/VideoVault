@@ -60,6 +60,9 @@ class VideoModel(QAbstractListModel):
                 lines.append("🏷 " + v["tag_names"])
             if v.get("memo"):
                 lines.append("📝 " + v["memo"][:120])
+            if v.get("has_sub"):
+                lines.append("💬 자막 있음")
+
             lines.append(v["full_path"] or f"연결 안 됨: {v.get('drive_name') or ''}")
             return "\n".join(lines)
         return None
@@ -69,6 +72,18 @@ class VideoDelegate(QStyledItemDelegate):
     def __init__(self, model, parent=None):
         super().__init__(parent)
         self.model = model
+        self.preview_id = None      # 커서를 올린 영상 id (미리보기 중)
+        self.preview_pix = None
+
+    def _preview(self, vid, size, widget):
+        if vid != self.preview_id or self.preview_pix is None or self.preview_pix.isNull():
+            return None
+        dpr = widget.devicePixelRatioF() if widget else 1.0
+        pix = self.preview_pix.scaled(int(size.width() * dpr), int(size.height() * dpr),
+                                      Qt.AspectRatioMode.KeepAspectRatio,
+                                      Qt.TransformationMode.SmoothTransformation)
+        pix.setDevicePixelRatio(dpr)
+        return pix
 
     def sizeHint(self, option, index):
         return QSize(CARD_W, CARD_H)
@@ -127,7 +142,9 @@ class VideoDelegate(QStyledItemDelegate):
         # 썸네일
         tr = QRect(r.x(), r.y(), r.width(), THUMB_H)
         p.fillRect(tr, QColor("#000000"))
-        pix = self._thumb(v.get("thumb_path"), tr.size(), option.widget)
+        pix = (self._preview(v["id"], tr.size(), option.widget)
+            or self._thumb(v.get("thumb_path"), tr.size(), option.widget))
+
         if pix:
             sz = pix.deviceIndependentSize().toSize()
             p.drawPixmap(tr.x() + (tr.width() - sz.width()) // 2,
@@ -150,6 +167,9 @@ class VideoDelegate(QStyledItemDelegate):
         if res:
             self._badge(p, font, res, tr, "tr", "#cc1565c0" if res == "4K" else "#aa000000")
         self._badge(p, font, fmt_duration(v.get("duration")), tr, "br", "#bb000000")
+        if v.get("has_sub"):
+            self._badge(p, font, "자막", tr, "bl", "#dd00897b")
+
 
         # 이어보기 진행 막대
         if v.get("resume_pos") and v.get("duration"):

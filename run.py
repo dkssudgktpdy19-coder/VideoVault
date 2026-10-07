@@ -73,6 +73,8 @@ def main():
     apply_dark_theme(app)
     window = MainWindow()
     quick_exit.install(window)
+    from app import style
+    style.apply()
     from app import backup, thumb_tool
     backup.install(window)
     thumb_tool.install(window)
@@ -83,6 +85,9 @@ def main():
     face_ui.install(window)
     from app import sub_ui
     sub_ui.install(window)
+    from app import hover_preview
+    hover_preview.install(window)
+
 
 
 

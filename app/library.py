@@ -36,13 +36,19 @@ TEXT_SQL = (
 
 
 def _attach_paths(conn, rows):
-    """지금 연결된 드라이브 문자로 실제 경로를 붙임"""
+    """지금 연결된 드라이브 문자로 실제 경로를 붙임 + 자막 있는지 표시"""
     letters = drive_letters(conn)
+    try:
+        subs = {r[0] for r in conn.execute("SELECT DISTINCT video_id FROM sub_files")}
+    except Exception:
+        subs = set()
     for r in rows:
         letter = letters.get(r["drive_id"])
         r["full_path"] = os.path.join(letter + "\\", r["rel_path"]) if letter else None
         r["online"] = bool(letter) and not r["is_missing"]
+        r["has_sub"] = r["id"] in subs
     return rows
+
 
 
 def load_videos(conn, text="", sort="추가된 순 (최신)", only_new=False,

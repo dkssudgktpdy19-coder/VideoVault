@@ -255,6 +255,10 @@ class SubManager:
         self._status(f"💬 자막: {msg}")
         if not msg.startswith("❌"):
             self.loader.reload_if_playing(vid)
+            try:
+                self.w.refresh_video(vid)       # 썸네일에 '자막' 배지 바로 표시
+            except Exception:
+                pass
 
     def _finished(self):
         self.label.setText("")
@@ -280,6 +284,11 @@ class SubManager:
             st.clear_subs(self.w.conn, d["id"])
         self.w.conn.commit()
         self._status("🗑 자막을 지웠습니다")
+        try:
+            self.w.reload(keep=True)
+        except Exception:
+            pass
+
 
     def stop(self):
         if self.running():

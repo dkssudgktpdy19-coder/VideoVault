@@ -337,6 +337,14 @@ class MainWindow(QMainWindow):
         for n in range(5, -1, -1):
             _menu_item(rate, "★" * n if n else "별점 지우기", lambda n=n: self.set_rating(n))
         _menu_item(menu, f"NEW 표시 지우기 ({count}개)", self.clear_new_selected)
+        subs = getattr(self, "_vv_subs", None)
+        if subs is not None:
+            menu.addSeparator()
+            _menu_item(menu, f"💬 자막 만들기 ({count}개)    Ctrl+G",
+                       lambda: subs.make(self.selected_videos()))
+            if any(x.get("has_sub") for x in self.selected_videos()):
+                _menu_item(menu, "🗑 자막 지우기", subs.delete_selected)
+
         menu.addSeparator()
         if v["full_path"]:
             path = v["full_path"]
