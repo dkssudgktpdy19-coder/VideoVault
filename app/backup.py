@@ -17,6 +17,7 @@ from app import config
 DATA_DIR = Path(config.DATA_DIR)
 BACKUP_DIR = Path(getattr(config, "BACKUP_DIR", DATA_DIR / "backups"))
 THUMB_DIR = Path(getattr(config, "THUMB_DIR", DATA_DIR / "thumbs"))
+SUB_DIR = Path(getattr(config, "SUB_DIR", DATA_DIR / "subs"))
 KEEP = int(getattr(config, "BACKUP_KEEP", 7))
 STATE_FILE = DATA_DIR / "backup_state.json"
 AUTO_GAP = 20 * 3600            # 마지막 자동 백업 후 20시간 지나면 다시
@@ -91,6 +92,9 @@ def make_backup(conn, kind="manual"):
             z.write(snap, "videovault.db")
             for f in THUMB_DIR.glob(CUSTOM_GLOB):
                 z.write(f, "custom_thumbs/" + f.name)
+            for f in SUB_DIR.glob("*.srt"):
+                z.write(f, "subs/" + f.name)
+
             z.writestr("info.json", json.dumps(
                 {"created": stamp, "kind": kind, "summary": summary},
                 ensure_ascii=False, indent=2))
@@ -139,6 +143,10 @@ def restore(conn, zip_path, db):
         for n in z.namelist():
             if n.startswith("custom_thumbs/") and not n.endswith("/"):
                 (THUMB_DIR / Path(n).name).write_bytes(z.read(n))
+            elif n.startswith("subs/") and not n.endswith("/"):
+                SUB_DIR.mkdir(parents=True, exist_ok=True)
+                (SUB_DIR / Path(n).name).write_bytes(z.read(n))
+
     shutil.rmtree(db.parent, ignore_errors=True)
 
 

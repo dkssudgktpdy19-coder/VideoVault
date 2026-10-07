@@ -1,8 +1,5 @@
-"""얼굴 정리 화면 (3단계-2)
-- 묶인 얼굴에 이름 붙이기 → 배우 등록 + 그 얼굴이 나온 영상에 배우 자동 추가
-- 같은 사람 합치기 / 잘못 묶인 얼굴 빼기 / 숨기기 / 비슷한 사람 찾기
-- 새 영상 얼굴 자동 분석 (재생 중에는 잠시 멈춤)
-"""
+"""얼굴 정리 화면: 이름 붙이기(추천), 합치기, 빼기, 숨기기, 확인 대기, 새 영상 자동 분석"""
+import html
 import json
 import os
 import time
@@ -16,18 +13,18 @@ from PySide6.QtWidgets import (QApplication, QCheckBox, QDialog, QHBoxLayout, QI
                                QMessageBox, QPushButton, QSpinBox, QSplitter, QVBoxLayout,
                                QWidget)
 
+from app import face_suggest as fs
 from app import faces as fc
 from app import thumb_tool as tt
 
 STATE_FILE = fc.DATA_DIR / "face_state.json"
-AUTO_FIRST = 90 * 1000          # 프로그램 켜고 90초 뒤 첫 자동 분석
-AUTO_EVERY = 10 * 60 * 1000     # 그 뒤 10분마다 새 영상 확인
+AUTO_FIRST = 90 * 1000
+AUTO_EVERY = 10 * 60 * 1000
 YES = QMessageBox.StandardButton.Yes
 ROLE_ID, ROLE_NAME, ROLE_CEN, ROLE_CNT = (Qt.UserRole, Qt.UserRole + 1,
                                           Qt.UserRole + 2, Qt.UserRole + 3)
 
 
-# ---------------- 설정 ----------------
 def _state():
     try:
         return json.loads(STATE_FILE.read_text(encoding="utf-8"))
@@ -49,13 +46,6 @@ def ensure(conn):
     conn.commit()
 
 
-def _va(conn):
-    cols = [r[1] for r in conn.execute("PRAGMA table_info(video_actors)")]
-    v = "video_id" if "video_id" in cols else next(c for c in cols if "video" in c)
-    a = "actor_id" if "actor_id" in cols else next(c for c in cols if "actor" in c)
-    return v, a, "source" in cols
-
-
 def actor_id(conn, name):
     row = conn.execute("SELECT id FROM actors WHERE name = ? COLLATE NOCASE", (name,)).fetchone()
     if row:
@@ -72,7 +62,7 @@ def actor_id(conn, name):
 
 def sync_actors(conn):
     """이름 붙은 얼굴이 나온 영상에 배우 추가 (한 번 추가한 건 다시 안 함 → 직접 지운 건 유지)"""
-    v, a, has_src = _va(conn)
+    v, a, has_src = fs.va_cols(conn)
     pairs = conn.execute("""
         SELECT DISTINCT f.video_id, p.actor_id FROM video_faces f
         JOIN face_people p ON p.id = f.person_id
@@ -95,8 +85,7 @@ def sync_actors(conn):
 
 
 def _unsync(conn, aid, vids):
-    """얼굴 때문에 자동으로 붙였던 배우만 떼기"""
-    v, a, _ = _va(conn)
+    v, a, _ = fs.va_cols(conn)
     for vid in vids:
         if conn.execute("SELECT 1 FROM face_actor_sync WHERE video_id=? AND actor_id=?",
                         (vid, aid)).fetchone():
@@ -107,18 +96,6 @@ def _unsync(conn, aid, vids):
 def _videos_of(conn, pid):
     return [r[0] for r in conn.execute(
         "SELECT DISTINCT video_id FROM video_faces WHERE person_id=?", (pid,))]
-
-
-def recompute(conn, pid):
-    embs = [np.frombuffer(e, np.float32) for (e,) in
-            conn.execute("SELECT emb FROM video_faces WHERE person_id=?", (pid,))]
-    if not embs:
-        conn.execute("DELETE FROM face_people WHERE id=?", (pid,))
-        return
-    s = np.sum(embs, axis=0)
-    s = s / np.linalg.norm(s)
-    conn.execute("UPDATE face_people SET centroid=?, n=? WHERE id=?",
-                 (s.astype(np.float32).tobytes(), len(embs), pid))
 
 
 def merge(conn, target, sources):
@@ -135,8 +112,12 @@ def merge(conn, target, sources):
         elif s_aid is not None and s_aid != t_aid:
             _unsync(conn, s_aid, _videos_of(conn, src))
         conn.execute("UPDATE video_faces SET person_id=? WHERE person_id=?", (target, src))
+        conn.execute("UPDATE person_samples SET person_id=? WHERE person_id=?", (target, src))
+        conn.execute("DELETE FROM face_name_rejects WHERE person_id=?", (src,))
         conn.execute("DELETE FROM face_people WHERE id=?", (src,))
-    recompute(conn, target)
+    if t_aid is not None:
+        fc.snapshot_anchors(conn, target, strict=False)
+    fc.recompute(conn, target)
     conn.commit()
     return sync_actors(conn)
 
@@ -148,33 +129,43 @@ def name_person(conn, pid, name):
         _unsync(conn, old[0], _videos_of(conn, pid))
     conn.execute("UPDATE face_people SET actor_id=?, name=?, hidden=0 WHERE id=?",
                  (aid, name, pid))
+    conn.execute("DELETE FROM face_name_rejects WHERE person_id=?", (pid,))
     others = [r[0] for r in conn.execute(
         "SELECT id FROM face_people WHERE actor_id=? AND id<>?", (aid, pid))]
     conn.commit()
     if others:
         return merge(conn, pid, others)
+    fc.snapshot_anchors(conn, pid, strict=False)
+    fc.recompute(conn, pid)
+    conn.commit()
     return sync_actors(conn)
 
 
 def not_this_person(conn, face_ids):
     touched = set()
     for fid in face_ids:
-        row = conn.execute("""SELECT f.person_id, f.video_id, f.emb, p.actor_id FROM video_faces f
+        row = conn.execute("""SELECT f.person_id, f.video_id, f.emb, p.actor_id,
+                                     COALESCE(a.name, p.name, '')
+                              FROM video_faces f
                               LEFT JOIN face_people p ON p.id = f.person_id
+                              LEFT JOIN actors a ON a.id = p.actor_id
                               WHERE f.id=?""", (fid,)).fetchone()
         if not row:
             continue
-        pid, vid, emb, aid = row
+        pid, vid, emb, aid, pname = row
         new = conn.execute("INSERT INTO face_people(centroid, n, created) VALUES (?,1,?)",
                            (emb, time.time())).lastrowid
         conn.execute("UPDATE video_faces SET person_id=? WHERE id=?", (new, fid))
+        conn.execute("DELETE FROM person_samples WHERE face_id=?", (fid,))
+        if pname:
+            conn.execute("INSERT OR IGNORE INTO face_name_rejects VALUES (?,?)", (new, pname.lower()))
         if aid and not conn.execute("SELECT 1 FROM video_faces WHERE person_id=? AND video_id=?",
                                     (pid, vid)).fetchone():
             _unsync(conn, aid, [vid])
         if pid:
             touched.add(pid)
     for pid in touched:
-        recompute(conn, pid)
+        fc.recompute(conn, pid)
     conn.commit()
 
 
@@ -182,12 +173,16 @@ def load_people(conn):
     return conn.execute("""
         SELECT p.id, COALESCE(a.name, p.name, ''), p.actor_id, p.hidden, p.centroid,
                COUNT(DISTINCT f.video_id),
-               (SELECT thumb FROM video_faces WHERE person_id = p.id
-                ORDER BY hits * score DESC LIMIT 1)
+               COALESCE((SELECT thumb FROM video_faces WHERE person_id = p.id
+                         ORDER BY hits * score DESC LIMIT 1),
+                        (SELECT thumb FROM person_samples WHERE person_id = p.id
+                         AND COALESCE(thumb, '') <> '' LIMIT 1))
         FROM face_people p
-        JOIN video_faces f ON f.person_id = p.id
+        LEFT JOIN video_faces f ON f.person_id = p.id
         LEFT JOIN actors a ON a.id = p.actor_id
-        GROUP BY p.id ORDER BY COUNT(DISTINCT f.video_id) DESC""").fetchall()
+        GROUP BY p.id
+        HAVING COUNT(f.id) > 0 OR p.actor_id IS NOT NULL OR COALESCE(p.name, '') <> ''
+        ORDER BY COUNT(DISTINCT f.video_id) DESC""").fetchall()
 
 
 # ---------------- 화면 도우미 ----------------
@@ -270,7 +265,7 @@ class AnalyzeThread(QThread):
         try:
             conn = fc.open_db()
             fc.ensure_tables(conn)
-            done = {r[0] for r in conn.execute("SELECT video_id FROM face_scan")}
+            done = fc.done_ids(conn)
             todo = {}
             for f in self.folders:
                 for v in fc.find_videos(conn, f):
@@ -412,11 +407,11 @@ class FacesDialog(QDialog):
         self.main = window
         self.conn = window.conn
         self.sim_ref = None
+        self.best = None
         self.setWindowTitle("👤 얼굴 정리")
-        self.resize(1150, 720)
+        self.resize(1150, 740)
         self.setWindowFlag(Qt.WindowType.WindowMaximizeButtonHint, True)
 
-        # 위쪽 조건
         self.search = QLineEdit()
         self.search.setPlaceholderText("이름 검색 (예: 원이, P12)")
         self.search.textChanged.connect(self.load)
@@ -428,14 +423,17 @@ class FacesDialog(QDialog):
         self.min_v.valueChanged.connect(self._min_changed)
         self.show_hidden = QCheckBox("숨긴 것도 보기")
         self.show_hidden.toggled.connect(self.load)
+        b_review = QPushButton("✅ 확인 대기 (R)")
+        b_review.setStyleSheet("font-weight:bold;")
+        b_review.clicked.connect(self.review)
         self.info = QLabel()
         top = QHBoxLayout()
         top.addWidget(self.search, 1)
         top.addWidget(self.min_v)
         top.addWidget(self.show_hidden)
+        top.addWidget(b_review)
         top.addWidget(self.info)
 
-        # 왼쪽: 사람 목록
         self.people = QListWidget()
         self.people.setViewMode(QListView.ViewMode.IconMode)
         self.people.setIconSize(QSize(96, 96))
@@ -467,9 +465,11 @@ class FacesDialog(QDialog):
         ll.addWidget(self.people, 1)
         ll.addLayout(lb)
 
-        # 오른쪽: 그 사람의 얼굴들
         self.face_title = QLabel("왼쪽에서 사람을 고르세요")
         self.face_title.setWordWrap(True)
+        self.sug = QLabel("")
+        self.sug.setWordWrap(True)
+        self.sug.setStyleSheet("color:#ffd54f; font-size:14px;")
         self.faces = QListWidget()
         self.faces.setViewMode(QListView.ViewMode.IconMode)
         self.faces.setIconSize(QSize(80, 80))
@@ -490,6 +490,7 @@ class FacesDialog(QDialog):
         rl = QVBoxLayout(right)
         rl.setContentsMargins(0, 0, 0, 0)
         rl.addWidget(self.face_title)
+        rl.addWidget(self.sug)
         rl.addWidget(self.faces, 1)
         rl.addLayout(rb)
 
@@ -498,7 +499,6 @@ class FacesDialog(QDialog):
         split.addWidget(right)
         split.setSizes([700, 450])
 
-        # 아래쪽: 분석
         b_an = QPushButton("🔍 새 영상 얼굴 분석")
         b_an.clicked.connect(lambda: self.main._vv_faces.start(manual=True))
         self.chk_auto = QCheckBox("새 영상 자동 분석 (재생 중엔 멈춤)")
@@ -528,8 +528,8 @@ class FacesDialog(QDialog):
         _shortcut("S", self.people, self.b_sim.toggle)
         _shortcut("H", self.people, self.hide_selected)
         _shortcut("Del", self.faces, self.not_this)
+        QShortcut(QKeySequence("R"), self).activated.connect(self.review)
 
-    # ----- 목록 -----
     def _min_changed(self, v):
         _set_state(min_videos=int(v))
         self.load()
@@ -557,8 +557,7 @@ class FacesDialog(QDialog):
         self.people.clear()
         target, named = None, 0
         for pid, name, hidden, cen, cnt, thumb, sim in rows:
-            label = name or f"P{pid}"
-            text = f"{label}\n영상 {cnt}개"
+            text = f"{name or f'P{pid}'}\n영상 {cnt}개"
             if sim is not None:
                 text += f" · {sim * 100:.0f}%"
             if hidden:
@@ -583,6 +582,8 @@ class FacesDialog(QDialog):
 
     def show_faces(self, cur, *_):
         self.faces.clear()
+        self.best = None
+        self.sug.setText("")
         if cur is None:
             self.face_title.setText("왼쪽에서 사람을 고르세요")
             return
@@ -598,8 +599,20 @@ class FacesDialog(QDialog):
             it.setToolTip(f"{name}\n{tt._fmt(t)}")
             it.setData(Qt.UserRole, (fid, vid, t or 0.0))
             self.faces.addItem(it)
-        self.face_title.setText(f"<b>{label}</b>: 얼굴 {len(rows)}개  "
+        self.face_title.setText(f"<b>{html.escape(label)}</b>: 얼굴 {len(rows)}개  "
                                 "(더블클릭 = 그 장면 재생, Del = 이 사람 아님)")
+        if not cur.data(ROLE_NAME):
+            try:
+                s = fs.suggest(self.conn, pid)
+            except Exception as e:
+                print("[추천 실패]", e)
+                s = []
+            if s:
+                self.best = s[0]["name"]
+                txt = "  /  ".join(f"<b>{html.escape(r['name'])}</b> {r['p'] * 100:.0f}%"
+                                   for r in s[:3])
+                self.sug.setText(f"💡 추천: {txt}<br><small>{html.escape(fs.reason(s[0]))}"
+                                 "  (더블클릭 → Enter로 바로 지정)</small>")
 
     def _sel_people(self):
         items = self.people.selectedItems()
@@ -607,24 +620,22 @@ class FacesDialog(QDialog):
             items = [self.people.currentItem()]
         return items
 
-    # ----- 동작 -----
     def name_selected(self, *_):
         items = self._sel_people()
         if not items:
             return
-        cur_name = next((it.data(ROLE_NAME) for it in items if it.data(ROLE_NAME)), "")
+        first = next((it.data(ROLE_NAME) for it in items if it.data(ROLE_NAME)), "") or self.best or ""
         names = [r[0] for r in self.conn.execute("SELECT name FROM actors ORDER BY name")]
-        choices = [cur_name] + [n for n in names if n != cur_name]
+        choices = [first] + [n for n in names if n != first]
         text, ok = QInputDialog.getItem(
             self, "이름 붙이기",
             f"선택한 {len(items)}명에게 붙일 배우 이름\n"
-            "(목록에서 고르거나 새로 입력. 같은 이름이면 한 사람으로 합쳐집니다)",
+            "(추천 이름이 들어가 있으면 Enter. 같은 이름이면 한 사람으로 합쳐집니다)",
             choices, 0, True)
         name = (text or "").strip()
         if not ok or not name:
             return
-        added = 0
-        last = None
+        added, last = 0, None
         for it in items:
             last = it.data(ROLE_ID)
             added += name_person(self.conn, last, name)
@@ -699,6 +710,19 @@ class FacesDialog(QDialog):
             QMessageBox.information(self, "재생", "메인 화면 목록에서 이 영상을 찾지 못했습니다.\n"
                                     "검색·필터를 해제하거나 외장하드 연결을 확인해 주세요.")
 
+    def review(self):
+        self.status.setText("후보 찾는 중…")
+        QApplication.processEvents()
+        queue = fs.build_queue(self.conn)
+        self.status.setText("대기 중")
+        if not queue:
+            QMessageBox.information(self, "확인 대기",
+                                    "확인할 후보가 없습니다.\n"
+                                    "먼저 몇 명에게 이름을 붙이면 닮은 사람이 후보로 올라옵니다.")
+            return
+        fs.ReviewDialog(self.main, self, queue).exec()
+        self.load()
+
 
 # ---------------- 설치 ----------------
 def open_dialog(window):
@@ -731,7 +755,7 @@ def install(window):
     tb.addAction(act)
     QShortcut(QKeySequence("Ctrl+Shift+F"), window).activated.connect(lambda: open_dialog(window))
 
-    try:   # 터미널에서 분석한 결과도 반영
+    try:
         if sync_actors(window.conn):
             QTimer.singleShot(500, lambda: _refresh_main(window))
     except Exception as e:

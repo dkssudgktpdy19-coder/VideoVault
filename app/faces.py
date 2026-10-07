@@ -1,8 +1,8 @@
-"""얼굴 인식 엔진 (3단계-1): 영상에서 얼굴을 찾아 같은 사람끼리 묶기
+"""얼굴 인식 엔진 v2: 흐린·옆얼굴 제외, 여러 샘플 비교, 이름 붙인 사람 유지
   python -m app.faces --check                 GPU·모델 확인
-  python -m app.faces "C:\\yt-dlp" --limit 10   폴더 안 영상 분석 (멈춰도 이어서 함)
+  python -m app.faces "C:\\yt-dlp"             폴더 안 영상 분석 (멈춰도 이어서 함)
   python -m app.faces --report                묶인 결과 미리보기 이미지
-  python -m app.faces --recluster             묶기만 다시 하기 (기준값 바꾼 뒤)
+  python -m app.faces --recluster             묶기만 다시 하기 (이름 붙인 사람은 유지)
 """
 import argparse
 import os
@@ -18,14 +18,22 @@ import numpy as np
 
 from app import config
 
+FACE_VER = 2           # 분석 방식 버전 (바뀌면 영상을 다시 분석)
+
 # ---------------- 조정 가능한 값 ----------------
-DET_THRESH = 0.60      # 얼굴로 인정할 최소 확신도
-MIN_FACE = 40          # 이보다 작은 얼굴(픽셀)은 무시
-SAME_IN_VIDEO = 0.50   # 한 영상 안에서 같은 사람으로 볼 유사도
-SAME_PERSON = 0.45     # 영상끼리 같은 사람으로 묶을 유사도 (섞이면 ↑, 쪼개지면 ↓)
-MIN_FRAMES, MAX_FRAMES, SEC_PER_FRAME = 6, 20, 30
+DET_THRESH = 0.50      # 얼굴로 인정할 최소 확신도 (못 찾으면 ↓)
+MIN_FACE = 32          # 이보다 작은 얼굴(픽셀)은 무시
+BLUR_MIN = 20.0        # 이보다 흐린 얼굴은 비교에 안 씀
+YAW_MAX = 0.60         # 이보다 옆으로 돌린 얼굴은 비교에 안 씀
+SAME_IN_VIDEO = 0.45   # 한 영상 안에서 같은 사람으로 볼 유사도
+SAME_PERSON = 0.45     # 영상끼리 자동으로 묶을 유사도 (섞이면 ↑, 쪼개지면 ↓)
+NAMED_AUTO = 0.50      # 이름 붙인 사람에게 자동으로 붙일 유사도 (더 엄격)
+TOPK = 3               # 가장 닮은 샘플 몇 개의 평균으로 비교할지
+SAMPLE_CAP = 30        # 사람마다 비교에 쓸 최대 샘플 수
+ANCHOR_MIN = 0.40      # 예전 결과에서 이름 붙인 사람의 샘플로 남길 기준
+MIN_FRAMES, MAX_FRAMES, SEC_PER_FRAME = 8, 30, 20
 GRAB_WORKERS = 4
-DET_SIZE = 640
+DET_SIZE = 800
 DIM = 512
 
 DATA_DIR = Path(config.DATA_DIR)
@@ -59,6 +67,14 @@ def _read_img(path):
         return None
 
 
+def _unlink(path):
+    try:
+        if path:
+            Path(path).unlink(missing_ok=True)
+    except OSError:
+        pass
+
+
 def _crop(img, box, size=160):
     x1, y1, x2, y2 = box
     cx, cy = (x1 + x2) / 2, (y1 + y2) / 2
@@ -75,7 +91,7 @@ def _crop(img, box, size=160):
 def _model(name):
     found = list(MODEL_DIR.rglob(name))
     if not found:
-        raise FileNotFoundError(f"모델 파일이 없습니다: {MODEL_DIR}\\{name}  (STEP 2 확인)")
+        raise FileNotFoundError(f"모델 파일이 없습니다: {MODEL_DIR}\\{name}")
     return str(found[0])
 
 
@@ -97,6 +113,8 @@ class FaceEngine:
         self.det_in = self.det.get_inputs()[0].name
         self.det_out = [o.name for o in self.det.get_outputs()]
         self.rec_in = self.rec.get_inputs()[0].name
+        shp = self.det.get_inputs()[0].shape
+        self.size = shp[2] if isinstance(shp[2], int) and shp[2] > 0 else DET_SIZE
         self.version = ort.__version__
         self._centers = {}
 
@@ -109,16 +127,16 @@ class FaceEngine:
         return self._centers[key]
 
     def detect(self, img):
+        S = self.size
         ih, iw = img.shape[:2]
         if ih > iw:
-            nh, nw = DET_SIZE, max(1, int(DET_SIZE * iw / ih))
+            nh, nw = S, max(1, int(S * iw / ih))
         else:
-            nw, nh = DET_SIZE, max(1, int(DET_SIZE * ih / iw))
+            nw, nh = S, max(1, int(S * ih / iw))
         scale = nh / ih
-        canvas = np.zeros((DET_SIZE, DET_SIZE, 3), np.uint8)
+        canvas = np.zeros((S, S, 3), np.uint8)
         canvas[:nh, :nw] = cv2.resize(img, (nw, nh))
-        blob = cv2.dnn.blobFromImage(canvas, 1 / 128, (DET_SIZE, DET_SIZE),
-                                     (127.5, 127.5, 127.5), swapRB=True)
+        blob = cv2.dnn.blobFromImage(canvas, 1 / 128, (S, S), (127.5, 127.5, 127.5), swapRB=True)
         outs = self.det.run(self.det_out, {self.det_in: blob})
         outs = [o[0] if o.ndim == 3 else o for o in outs]
         fmc = len(outs) // 3
@@ -127,7 +145,7 @@ class FaceEngine:
             sc = outs[i].reshape(-1)
             bb = outs[i + fmc].reshape(-1, 4) * s
             kp = outs[i + 2 * fmc].reshape(-1, 5, 2) * s
-            h = w = DET_SIZE // s
+            h = w = S // s
             c = self._anchors(h, w, s, max(1, sc.shape[0] // (h * w)))
             keep = np.where(sc >= DET_THRESH)[0]
             if not len(keep):
@@ -152,18 +170,31 @@ class FaceEngine:
         return out
 
     def analyze(self, img):
-        faces = self.detect(img)
         aligned, info = [], []
-        for box, score, kps in faces:
+        for box, score, kps in self.detect(img):
+            le, rei, nose = kps[0], kps[1], kps[2]
+            v = rei - le
+            ed = float(np.linalg.norm(v))
+            if ed < 2:
+                continue
+            yaw = abs(float(np.dot(nose - (le + rei) / 2, v / ed))) / ed   # 옆얼굴 정도
+            if yaw > YAW_MAX:
+                continue
             M, _ = cv2.estimateAffinePartial2D(kps.astype(np.float32), ARC_DST, method=cv2.LMEDS)
             if M is None:
+                continue
+            al = cv2.warpAffine(img, M, (112, 112), borderValue=0)
+            blur = float(cv2.Laplacian(cv2.cvtColor(al, cv2.COLOR_BGR2GRAY), cv2.CV_64F).var())
+            if blur < BLUR_MIN:
                 continue
             crop = _crop(img, box)
             if crop is None:
                 continue
-            aligned.append(cv2.warpAffine(img, M, (112, 112), borderValue=0))
             size = float(min(box[2] - box[0], box[3] - box[1]))
-            info.append({"score": score, "size": size, "crop": crop, "q": score * size})
+            w = score * min(1.0, blur / 80) * (1 - 0.5 * yaw / YAW_MAX)
+            aligned.append(al)
+            info.append({"score": score, "size": size, "crop": crop, "w": max(w, 1e-3),
+                         "q": w * min(size, 200)})
         if not aligned:
             return []
         blob = cv2.dnn.blobFromImages(aligned, 1 / 127.5, (112, 112),
@@ -215,7 +246,7 @@ def sample_times(dur):
     if not dur or dur <= 0:
         return [0.0]
     n = int(min(MAX_FRAMES, max(MIN_FRAMES, dur // SEC_PER_FRAME)))
-    return [dur * (0.05 + 0.9 * (k + 0.5) / n) for k in range(n)]
+    return [dur * (0.04 + 0.92 * (k + 0.5) / n) for k in range(n)]
 
 
 # ---------------- DB ----------------
@@ -241,9 +272,31 @@ def ensure_tables(conn):
     CREATE INDEX IF NOT EXISTS idx_vf_person ON video_faces(person_id);
     CREATE TABLE IF NOT EXISTS face_scan(
         video_id INTEGER PRIMARY KEY REFERENCES videos(id) ON DELETE CASCADE,
-        done REAL, frames INTEGER, faces INTEGER, status TEXT);
+        done REAL, frames INTEGER, faces INTEGER, status TEXT, ver INTEGER DEFAULT 1);
+    CREATE TABLE IF NOT EXISTS person_samples(
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        person_id INTEGER NOT NULL REFERENCES face_people(id) ON DELETE CASCADE,
+        face_id INTEGER, emb BLOB NOT NULL, thumb TEXT DEFAULT '');
+    CREATE INDEX IF NOT EXISTS idx_ps_person ON person_samples(person_id);
+    CREATE TABLE IF NOT EXISTS face_name_rejects(
+        person_id INTEGER, name TEXT, PRIMARY KEY(person_id, name));
+    CREATE TABLE IF NOT EXISTS face_meta(key TEXT PRIMARY KEY, value TEXT);
     """)
+    cols = {r[1] for r in conn.execute("PRAGMA table_info(face_scan)")}
+    if "ver" not in cols:
+        conn.execute("ALTER TABLE face_scan ADD COLUMN ver INTEGER DEFAULT 1")
     conn.commit()
+    _migrate(conn)
+
+
+def done_ids(conn):
+    return {r[0] for r in conn.execute(
+        "SELECT video_id FROM face_scan WHERE COALESCE(ver, 1) >= ?", (FACE_VER,))}
+
+
+def named_ids(conn):
+    return {r[0] for r in conn.execute(
+        "SELECT id FROM face_people WHERE actor_id IS NOT NULL OR COALESCE(name, '') <> ''")}
 
 
 def find_videos(conn, folder):
@@ -274,6 +327,107 @@ def find_videos(conn, folder):
     return out
 
 
+# ---------------- 사람별 샘플 ----------------
+def _consistent(E):
+    """서로 잘 맞는 얼굴만 True (섞인 묶음에서 다른 사람 걸러내기)"""
+    if len(E) <= 2:
+        return np.ones(len(E), bool)
+    M = E @ E.T
+    score = (M.sum(1) - 1) / (len(E) - 1)
+    top = np.argsort(-score)[:max(2, len(E) // 2)]
+    c = E[top].sum(0)
+    c = c / max(np.linalg.norm(c), 1e-6)
+    return (E @ c) >= ANCHOR_MIN
+
+
+def snapshot_anchors(conn, pid, strict=False):
+    """이름 붙인 사람의 얼굴을 고정 샘플로 보관 (다시 분석해도 이름 유지)"""
+    rows = conn.execute("SELECT id, emb, thumb FROM video_faces WHERE person_id=? "
+                        "ORDER BY hits * score DESC LIMIT ?", (pid, SAMPLE_CAP * 2)).fetchall()
+    if not rows:
+        return 0
+    E = np.vstack([np.frombuffer(r[1], np.float32) for r in rows])
+    keep = _consistent(E) if strict else np.ones(len(rows), bool)
+    have = {r[0] for r in conn.execute("SELECT face_id FROM person_samples WHERE person_id=?", (pid,))}
+    n = 0
+    for (fid, emb, th), ok in zip(rows, keep):
+        if not ok or fid in have:
+            continue
+        dst = ""
+        if th and os.path.isfile(th):
+            dst = str(FACE_DIR / f"anchor_{fid}.jpg")
+            try:
+                shutil.copy2(th, dst)
+            except OSError:
+                dst = ""
+        conn.execute("INSERT INTO person_samples(person_id, face_id, emb, thumb) VALUES (?,?,?,?)",
+                     (pid, fid, emb, dst))
+        n += 1
+    old = conn.execute("SELECT id, thumb FROM person_samples WHERE person_id=? "
+                       "ORDER BY id DESC LIMIT -1 OFFSET ?", (pid, SAMPLE_CAP * 2)).fetchall()
+    for sid, th in old:
+        _unlink(th)
+        conn.execute("DELETE FROM person_samples WHERE id=?", (sid,))
+    return n
+
+
+def load_samples(conn):
+    per = {}
+    for pid, emb, q in conn.execute("SELECT person_id, emb, COALESCE(hits,1) * COALESCE(score,0.5) "
+                                    "FROM video_faces WHERE person_id IS NOT NULL"):
+        per.setdefault(pid, []).append((q, emb))
+    for pid, emb in conn.execute("SELECT person_id, emb FROM person_samples"):
+        per.setdefault(pid, []).append((1e9, emb))
+    out = {}
+    for pid, lst in per.items():
+        lst.sort(key=lambda x: -x[0])
+        out[pid] = np.vstack([np.frombuffer(e, np.float32) for _, e in lst[:SAMPLE_CAP]])
+    return out
+
+
+def recompute(conn, pid):
+    embs = [np.frombuffer(e, np.float32) for (e,) in conn.execute(
+        "SELECT emb FROM video_faces WHERE person_id=? UNION ALL "
+        "SELECT emb FROM person_samples WHERE person_id=?", (pid, pid))]
+    if not embs:
+        conn.execute("DELETE FROM face_people WHERE id=? AND actor_id IS NULL "
+                     "AND COALESCE(name, '') = ''", (pid,))
+        return
+    s = np.sum(embs, axis=0)
+    s = s / max(np.linalg.norm(s), 1e-6)
+    conn.execute("UPDATE face_people SET centroid=?, n=? WHERE id=?",
+                 (s.astype(np.float32).tobytes(), len(embs), pid))
+
+
+def cleanup_empty(conn):
+    conn.execute("""DELETE FROM face_people WHERE actor_id IS NULL AND COALESCE(name, '') = ''
+        AND id NOT IN (SELECT person_id FROM video_faces WHERE person_id IS NOT NULL)
+        AND id NOT IN (SELECT person_id FROM person_samples)""")
+
+
+def _migrate(conn):
+    row = conn.execute("SELECT value FROM face_meta WHERE key='ver'").fetchone()
+    if row and int(row[0]) >= FACE_VER:
+        return
+    named = named_ids(conn)
+    for pid in named:
+        snapshot_anchors(conn, pid, strict=True)
+    had = conn.execute("SELECT COUNT(*) FROM video_faces").fetchone()[0]
+    for (th,) in conn.execute("SELECT thumb FROM video_faces").fetchall():
+        _unlink(th)
+    conn.execute("DELETE FROM video_faces")
+    conn.execute("DELETE FROM face_scan")
+    conn.execute("DELETE FROM face_name_rejects")
+    cleanup_empty(conn)
+    for pid in named:
+        recompute(conn, pid)
+    conn.execute("INSERT OR REPLACE INTO face_meta(key, value) VALUES ('ver', ?)", (str(FACE_VER),))
+    conn.commit()
+    if had:
+        print(f"[얼굴] 인식 방식 v{FACE_VER}로 업그레이드: 이름 붙인 {len(named)}명은 유지, "
+              "영상은 다시 분석합니다")
+
+
 # ---------------- 영상 하나 처리 ----------------
 def group_faces(found, many):
     groups = []
@@ -284,14 +438,14 @@ def group_faces(found, many):
             if s > bs:
                 best, bs = g, s
         if best:
-            best["sum"] += f["emb"]
+            best["sum"] += f["emb"] * f["w"]
             best["hits"] += 1
             best["emb"] = best["sum"] / np.linalg.norm(best["sum"])
         else:
-            groups.append({"sum": f["emb"].copy(), "emb": f["emb"], "hits": 1, "best": f})
-    if many:   # 장면이 많은데 한 번만 스친 흐릿한 얼굴은 버림
+            groups.append({"sum": f["emb"] * f["w"], "emb": f["emb"], "hits": 1, "best": f})
+    if many:   # 장면이 많은데 한 번만 스친 얼굴은 또렷할 때만 남김
         groups = [g for g in groups if g["hits"] >= 2
-                  or (g["best"]["score"] >= 0.8 and g["best"]["size"] >= 80)]
+                  or (g["best"]["score"] >= 0.7 and g["best"]["size"] >= 60)]
     return groups
 
 
@@ -311,8 +465,7 @@ def process_video(eng, conn, vid, path, dur):
             found.append(f)
     groups = group_faces(found, many=ok >= 8)
     for (th,) in conn.execute("SELECT thumb FROM video_faces WHERE video_id=?", (vid,)).fetchall():
-        if th:
-            Path(th).unlink(missing_ok=True)
+        _unlink(th)
     conn.execute("DELETE FROM video_faces WHERE video_id=?", (vid,))
     for g in groups:
         b = g["best"]
@@ -321,63 +474,75 @@ def process_video(eng, conn, vid, path, dur):
                             b["score"], b["t"])).lastrowid
         conn.execute("UPDATE video_faces SET thumb=? WHERE id=?",
                      (_save_jpg(FACE_DIR / f"vf{fid}.jpg", b["crop"]), fid))
-    conn.execute("INSERT OR REPLACE INTO face_scan(video_id, done, frames, faces, status) "
-                 "VALUES (?,?,?,?,?)", (vid, time.time(), ok, len(groups), "ok" if ok else "noframe"))
+    conn.execute("INSERT OR REPLACE INTO face_scan(video_id, done, frames, faces, status, ver) "
+                 "VALUES (?,?,?,?,?,?)", (vid, time.time(), ok, len(groups),
+                                          "ok" if ok else "noframe", FACE_VER))
     conn.commit()
     return ok, len(groups)
 
 
 # ---------------- 영상끼리 같은 사람 묶기 ----------------
 def cluster(conn):
-    rows = conn.execute("SELECT id, centroid, n FROM face_people WHERE centroid IS NOT NULL").fetchall()
-    cap = max(256, len(rows) * 2)
-    C = np.zeros((cap, DIM), np.float32)
+    named = named_ids(conn)
+    sets = load_samples(conn)
+    total = sum(len(a) for a in sets.values())
+    cap = max(1024, total * 2)
     S = np.zeros((cap, DIM), np.float32)
-    N = np.zeros(cap, np.int64)
-    pids = []
-    for i, (pid, cen, n) in enumerate(rows):
-        v = np.frombuffer(cen, np.float32)
-        C[i], S[i], N[i] = v, v * max(n, 1), max(n, 1)
-        pids.append(pid)
-    m = len(rows)
+    O = np.full(cap, -1, np.int64)
+    m, count = 0, {}
+    for pid, arr in sets.items():
+        S[m:m + len(arr)] = arr
+        O[m:m + len(arr)] = pid
+        m += len(arr)
+        count[pid] = len(arr)
     todo = conn.execute("SELECT id, emb FROM video_faces WHERE person_id IS NULL "
-                        "ORDER BY hits DESC, score DESC").fetchall()
+                        "ORDER BY hits * score DESC").fetchall()
     touched, new = set(), 0
+    low = min(SAME_PERSON, NAMED_AUTO) - 0.05
     for fid, emb in todo:
         e = np.frombuffer(emb, np.float32)
-        j = -1
+        pid, best = None, 0.0
         if m:
-            sims = C[:m] @ e
-            j = int(sims.argmax())
-            if sims[j] < SAME_PERSON:
-                j = -1
-        if j < 0:
+            sims = S[:m] @ e
+            owners = O[:m]
+            for o in np.unique(owners[sims >= low]):
+                o = int(o)
+                sc = float(np.sort(sims[owners == o])[-TOPK:].mean())
+                need = NAMED_AUTO if o in named else SAME_PERSON
+                if sc >= need and sc > best:
+                    pid, best = o, sc
+        if pid is None:
+            pid = conn.execute("INSERT INTO face_people(n, created) VALUES (0, ?)",
+                               (time.time(),)).lastrowid
+            new += 1
+        conn.execute("UPDATE video_faces SET person_id=? WHERE id=?", (pid, fid))
+        touched.add(pid)
+        if count.get(pid, 0) < SAMPLE_CAP:
             if m == cap:
-                C = np.vstack([C, np.zeros_like(C)])
                 S = np.vstack([S, np.zeros_like(S)])
-                N = np.concatenate([N, np.zeros_like(N)])
+                O = np.concatenate([O, np.full(cap, -1, np.int64)])
                 cap *= 2
-            pids.append(conn.execute("INSERT INTO face_people(n, created) VALUES (0, ?)",
-                                     (time.time(),)).lastrowid)
-            j, m, new = m, m + 1, new + 1
-        S[j] += e
-        N[j] += 1
-        C[j] = S[j] / np.linalg.norm(S[j])
-        conn.execute("UPDATE video_faces SET person_id=? WHERE id=?", (pids[j], fid))
-        touched.add(j)
-    for j in touched:
-        conn.execute("UPDATE face_people SET centroid=?, n=? WHERE id=?",
-                     (C[j].tobytes(), int(N[j]), pids[j]))
+            S[m], O[m] = e, pid
+            m += 1
+            count[pid] = count.get(pid, 0) + 1
+    for pid in touched:
+        recompute(conn, pid)
+    cleanup_empty(conn)
     conn.commit()
     return len(todo), new
 
 
 def recluster(conn):
+    named = named_ids(conn)
+    for pid in named:
+        snapshot_anchors(conn, pid, strict=False)
     conn.execute("UPDATE video_faces SET person_id=NULL")
-    conn.execute("DELETE FROM face_people")
+    conn.execute("DELETE FROM face_name_rejects")
+    cleanup_empty(conn)
     conn.commit()
     n, new = cluster(conn)
-    print(f"다시 묶기 완료: 얼굴 {n}개 → 사람 {new}명 (기준 {SAME_PERSON})")
+    print(f"다시 묶기 완료: 얼굴 {n}개 → 새 사람 {new}명 + 이름 붙인 {len(named)}명 "
+          f"(기준 {SAME_PERSON} / 이름 붙인 사람 {NAMED_AUTO})")
 
 
 # ---------------- 실행 ----------------
@@ -391,22 +556,20 @@ def check():
     for _ in range(10):
         eng.detect(dummy)
     ms = (time.time() - t0) * 100
-    if eng.device == "GPU":
-        print(f"✅ 준비 완료: GPU 사용 (얼굴 찾기 장면당 {ms:.0f}ms)")
-    else:
-        print(f"⚠ GPU를 못 쓰고 CPU로 동작합니다 (장면당 {ms:.0f}ms, 느림)")
+    print(f"{'✅ 준비 완료: GPU' if eng.device == 'GPU' else '⚠ CPU'} 사용 "
+          f"(얼굴 찾기 크기 {eng.size}, 장면당 {ms:.0f}ms)")
 
 
 def scan(folder, limit=None, redo=False):
     if not os.path.isdir(folder):
         print("폴더를 찾을 수 없습니다:", folder)
         return
-    eng = FaceEngine()
-    print(f"얼굴 엔진 준비: {eng.device}")
     conn = open_db()
     ensure_tables(conn)
+    eng = FaceEngine()
+    print(f"얼굴 엔진 준비: {eng.device}")
     vids = find_videos(conn, folder)
-    done = {r[0] for r in conn.execute("SELECT video_id FROM face_scan")}
+    done = done_ids(conn)
     todo = vids if redo else [v for v in vids if v[0] not in done]
     if limit:
         todo = todo[:limit]
@@ -430,7 +593,6 @@ def scan(folder, limit=None, redo=False):
     n, new = cluster(conn)
     print(f"===== 완료: 영상 {i}개, 얼굴 {faces}개, 오류 {errors}개, "
           f"{time.time() - t0:.0f}초 | 새 사람 {new}명 =====")
-    print("결과 보기: python -m app.faces --report")
     conn.close()
 
 
@@ -445,7 +607,6 @@ def report(top=40, per=8):
                         (top,)).fetchall()
     print(f"분석한 영상 {nv}개 | 찾은 얼굴 {nf}개 | 영상 2개 이상에 나온 사람 {len(rows)}명")
     if not rows:
-        print("아직 여러 영상에 나온 사람이 없습니다. 영상을 더 분석해 보세요.")
         return
     tile, label = 96, 150
     lines = []

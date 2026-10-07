@@ -81,6 +81,9 @@ def main():
     presets.install(window)
     from app import face_ui
     face_ui.install(window)
+    from app import sub_ui
+    sub_ui.install(window)
+
 
 
 
