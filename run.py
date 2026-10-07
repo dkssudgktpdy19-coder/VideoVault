@@ -87,6 +87,9 @@ def main():
     sub_ui.install(window)
     from app import hover_preview
     hover_preview.install(window)
+    from app import manage
+    manage.install(window)
+
 
 
 

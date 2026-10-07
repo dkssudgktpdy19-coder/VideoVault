@@ -3,10 +3,11 @@ import json
 import os
 from pathlib import Path
 
-from PySide6.QtCore import QThread, QTimer, Signal
+from PySide6.QtCore import Qt, QThread, QTimer, Signal
 from PySide6.QtGui import QKeySequence, QShortcut
 from PySide6.QtWidgets import (QApplication, QInputDialog, QLabel, QMenu, QMessageBox,
-                               QToolButton, QWidget)
+                               QPushButton, QToolButton, QWidget)
+
 
 from app import faces as fc
 from app import marks
@@ -367,6 +368,69 @@ def make_current(window, mgr):
         return
     mgr.make([d], parent=pw)
 
+# ---------------- 플레이어 안 자막 버튼 (#9) ----------------
+class SubBar:
+    def __init__(self, window, mgr):
+        self.w, self.mgr = window, mgr
+        row = getattr(window.player, "row2", None)
+        self.ok = row is not None
+        if not self.ok:
+            return
+
+        def btn(text, fn, tip):
+            b = QPushButton(text)
+            b.setToolTip(tip)
+            b.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+            b.setStyleSheet("font-size:12px;")
+            b.clicked.connect(lambda checked=False: fn())
+            row.addWidget(b)
+            return b
+
+        self.lbl = QLabel("")
+        self.lbl.setStyleSheet("font-size:12px;color:#8fd;padding:0 8px;")
+        row.addWidget(self.lbl)
+        self.b_make = btn("💬 자막 만들기", lambda: make_current(window, mgr), "이 영상 자막 만들기 (Ctrl+G)")
+        self.b_vis = btn("자막 끄기", lambda: toggle_vis(window), "자막 켜기/끄기 (V)")
+        self.b_cycle = btn("한/원 바꾸기", lambda: cycle(window), "한국어 ↔ 원문 (J)")
+        self.b_dual = btn("동시 표시", lambda: toggle_secondary(window), "한국어 + 원문 같이 (Shift+J)")
+        self.b_minus = btn("싱크 −0.1", lambda: delay(window, -0.1), "자막 0.1초 빠르게 (Z)")
+        self.b_plus = btn("싱크 +0.1", lambda: delay(window, 0.1), "자막 0.1초 늦게 (X)")
+        self.timer = QTimer(window.player)
+        self.timer.setInterval(500)
+        self.timer.timeout.connect(self.update)
+        self.timer.start()
+
+    def update(self):
+        if not self.w.player.isVisible():
+            return
+        mp = tt._mpv(self.w)
+        try:
+            subs = _subs(mp)
+            sid, vis = mp.sid, bool(mp.sub_visibility)
+            d, sec = float(mp.sub_delay or 0), mp["secondary-sid"]
+        except Exception:
+            subs, sid, vis, d, sec = [], None, True, 0.0, None
+        has = bool(subs)
+        for b in (self.b_vis, self.b_cycle, self.b_dual, self.b_minus, self.b_plus):
+            b.setVisible(has)
+        self.b_make.setText("💬 다시 만들기" if has else "💬 자막 만들기")
+        self.b_vis.setText("자막 끄기" if vis else "자막 켜기")
+        if has:
+            cur = next((t for t in subs if t.get("id") == sid), None)
+            name = (cur.get("title") or cur.get("lang") or "자막") if cur else "끔"
+            text = f"💬 {name}" + ("" if vis else " (숨김)")
+            if sec not in (False, None, "no"):
+                text += " · 동시 표시"
+            if d:
+                text += f" · 싱크 {d:+.1f}초"
+        else:
+            text = "💬 자막 없음"
+        if self.mgr.running():
+            text += "  ⏳ 자막 만드는 중"
+        self.lbl.setText(text)
+
+
+
 
 # ---------------- 설치 ----------------
 def install(window):
@@ -399,4 +463,5 @@ def install(window):
                         ("X", lambda: delay(window, 0.1)),
                         ("Ctrl+G", lambda: make_current(window, mgr))):
             QShortcut(QKeySequence(key), pw).activated.connect(fn)
+    window._vv_subbar = SubBar(window, mgr)
     QApplication.instance().aboutToQuit.connect(mgr.stop)

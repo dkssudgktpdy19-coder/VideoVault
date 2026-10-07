@@ -2,37 +2,58 @@
 import os
 
 import mpv
-from PySide6.QtCore import Qt, QTimer, Signal
+from PySide6.QtCore import QEvent, Qt, QTimer, Signal
+from PySide6.QtGui import QCursor
 from PySide6.QtWidgets import (QHBoxLayout, QLabel, QMenu, QMessageBox, QPushButton, QSlider,
                                QVBoxLayout, QWidget)
 
 from app import audio, library
 
-HELP_TEXT = """[이동]
-←  →              10초
-Shift + ←  →      1초
-Ctrl + ←  →       1분
-,  .              이전 / 다음 프레임 (자동 일시정지)
-Home              처음부터
-PgUp / PgDn       이전 / 다음 영상
+HELP = [
+    ("이동", [("← / →", "10초"), ("Shift + ← / →", "1초"), ("Ctrl + ← / →", "1분"),
+              (", / .", "이전 / 다음 프레임 (자동 일시정지)"), ("Home", "처음부터"),
+              ("PgUp / PgDn", "이전 / 다음 영상")]),
+    ("재생", [("Space", "재생 / 일시정지"), ("L", "구간 반복 (A 지정 → B 지정 → 해제)"),
+              ("A", "자동 재생 켜기/끄기 (끝나면 다음 영상)"), ("M", "소리 켜기/끄기"), ("↑ / ↓", "볼륨")]),
+    ("북마크", [("B", "지금 장면 북마크"), ("Shift + B", "메모 붙여서 북마크"),
+                ("[ / ]", "이전 / 다음 북마크로 이동"), ("Ctrl + B", "이 영상 북마크 목록")]),
+    ("자막", [("Ctrl + G", "이 영상 자막 만들기"), ("V", "자막 켜기/끄기"), ("J", "한국어 ↔ 원문"),
+              ("Shift + J", "한국어 + 원문 같이 보기"), ("Z / X", "자막 싱크 −0.1초 / +0.1초")]),
+    ("화면", [("E", "필터 패널 열기/닫기"), ("1 / 2", "밝기 − / +"), ("3 / 4", "대비 − / +"),
+              ("5 / 6", "채도 − / +"), ("7 / 8", "감마 − / +"), ("0", "필터 초기화"),
+              ("F, Enter", "전체화면 (영상만 · 마우스를 맨 아래로 → 조작 막대)"),
+              ("Esc", "전체화면 해제 / 닫기")]),
+    ("정리", [("T", "이 영상 태그·정보 편집"), ("Ctrl + T", "지금 장면을 썸네일로"), ("F1", "이 도움말")]),
+]
 
-[재생]
-Space             재생 / 일시정지
-L                 구간 반복 (A 지정 → B 지정 → 해제)
-A                 자동 재생 켜기/끄기 (끝나면 다음 영상)
-M                 소리 켜기/끄기
-↑  ↓              볼륨
+MAIN_HELP = [
+    ("메인 화면", [("더블클릭", "재생"), ("E", "태그·정보 편집"), ("0 ~ 5", "별점"),
+                   ("Ctrl + T", "썸네일 바꾸기"), ("Ctrl + G", "자막 만들기"), ("Ctrl + B", "북마크 모음"),
+                   ("Ctrl + S", "지금 검색 조건 저장"), ("Ctrl + 1 ~ 9", "저장한 검색 불러오기"),
+                   ("Ctrl + Shift + F", "얼굴 정리 창"), ("Shift + Del", "영구 삭제 (영상 파일까지)"),
+                   ("F1", "이 도움말 (재생 창 단축키는 재생 중에 F1)")]),
+    ("얼굴 정리 창", [("더블클릭, F2", "이름 붙이기"), ("M", "합치기"), ("S", "비슷한 순"),
+                      ("H", "숨기기"), ("Del", "이 사람 아님 (빼기)"),
+                      ("R", "확인 대기 (Y 맞음 · N 아님 · S 건너뛰기)")]),
+]
 
-[화면]
-E                 필터 패널 열기/닫기
-1 / 2             밝기 - / +
-3 / 4             대비 - / +
-5 / 6             채도 - / +
-7 / 8             감마 - / +
-0                 필터 초기화
-F, Enter          전체화면
-Esc               전체화면 해제 / 닫기
-F1                이 도움말"""
+
+def help_html(sections):
+    rows = []
+    for title, items in sections:
+        rows.append(f"<tr><td colspan=2 style='padding-top:10px;color:#4fc3f7;'><b>[{title}]</b></td></tr>")
+        for key, desc in items:
+            rows.append(f"<tr><td style='padding-right:22px;color:#ffeb3b;'><b>{key}</b></td><td>{desc}</td></tr>")
+    return "<table cellspacing=0 cellpadding=2>" + "".join(rows) + "</table>"
+
+
+def show_help_dialog(parent, sections, title="단축키 도움말"):
+    box = QMessageBox(parent)
+    box.setWindowTitle(title)
+    box.setTextFormat(Qt.TextFormat.RichText)
+    box.setText(help_html(sections))
+    box.exec()
+
 
 FILTERS = [("brightness", "밝기"), ("contrast", "대비"), ("saturation", "채도"),
            ("gamma", "감마"), ("hue", "색조")]
@@ -126,7 +147,7 @@ class PlayerWindow(QWidget):
         self.btn_audio = self._button("🔈 사운드 장치 확인 중...", self.show_audio_menu,
                                       "클릭해서 출력 장치 바꾸기")
         self.btn_audio.setStyleSheet("font-size:12px;color:#9ad;")
-        row2 = QHBoxLayout()
+        self.row2 = row2 = QHBoxLayout()
         row2.setContentsMargins(8, 0, 8, 4)
         row2.addWidget(self.btn_audio)
         row2.addStretch(1)
@@ -157,8 +178,13 @@ class PlayerWindow(QWidget):
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(0)
         layout.addWidget(self.video_area, 1)
-        layout.addLayout(bar)
-        layout.addLayout(row2)
+        self.controls = QWidget()
+        cl = QVBoxLayout(self.controls)
+        cl.setContentsMargins(0, 0, 0, 0)
+        cl.setSpacing(0)
+        cl.addLayout(bar)
+        cl.addLayout(row2)
+        layout.addWidget(self.controls)
         layout.addWidget(self.filter_panel)
 
         self._create_player()
@@ -168,6 +194,12 @@ class PlayerWindow(QWidget):
         self.timer = QTimer(self)
         self.timer.setInterval(250)
         self.timer.timeout.connect(self._tick)
+        # 전체화면: 영상만 보이게, 마우스를 맨 아래로 내리면 조작 막대 (#10)
+        self._filter_was_open = False
+        self._fs_timer = QTimer(self)
+        self._fs_timer.setInterval(200)
+        self._fs_timer.timeout.connect(self._fs_tick)
+
 
     # ---------- 엔진 만들기 / 살아있는지 확인 ----------
     def _create_player(self):
@@ -364,6 +396,9 @@ class PlayerWindow(QWidget):
             return
         try:
             self.player.seek(sec, "relative")
+            if self.isFullScreen():
+                self.player.command("show-progress")
+
         except Exception:
             return
         amount = f"{abs(sec) // 60}분" if abs(sec) >= 60 else f"{abs(sec)}초"
@@ -541,10 +576,35 @@ class PlayerWindow(QWidget):
         if self.isFullScreen():
             self.showNormal()
         else:
+            self._filter_was_open = self.filter_panel.isVisible()
             self.showFullScreen()
 
+    def changeEvent(self, e):
+        super().changeEvent(e)
+        if e.type() != QEvent.Type.WindowStateChange or not hasattr(self, "controls"):
+            return
+        if self.isFullScreen():
+            self.controls.hide()
+            self.filter_panel.hide()
+            self._fs_timer.start()
+            self.osd("전체화면 · 마우스를 맨 아래로 내리면 조작 막대 · Esc: 해제", 2500)
+        else:
+            self._fs_timer.stop()
+            self.controls.show()
+            self.filter_panel.setVisible(self._filter_was_open)
+
+    def _fs_tick(self):
+        if not self.isFullScreen():
+            self._fs_timer.stop()
+            return
+        pos, g = QCursor.pos(), self.geometry()
+        margin = self.controls.height() + 60 if self.controls.isVisible() else 60
+        near = g.contains(pos) and pos.y() >= g.bottom() - margin
+        if near != self.controls.isVisible():
+            self.controls.setVisible(near)
+
     def show_help(self):
-        QMessageBox.information(self, "단축키 도움말", HELP_TEXT)
+        show_help_dialog(self, HELP)
 
     def keyPressEvent(self, e):
         k, mod = e.key(), e.modifiers()

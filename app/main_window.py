@@ -352,6 +352,13 @@ class MainWindow(QMainWindow):
                        lambda: subprocess.Popen(["explorer", "/select,", path]))
             _menu_item(menu, "📋 파일 경로 복사",
                        lambda: QGuiApplication.clipboard().setText(path))
+
+        dt = getattr(self, "_vv_delete", None)
+        if dt is not None:
+            menu.addSeparator()
+            _menu_item(menu, f"⛔ 영구 삭제: 영상 파일까지 ({count}개)    Shift+Del",
+                       lambda: dt(self.selected_videos()))
+
         menu.exec(self.view.viewport().mapToGlobal(pos))
 
     # ---------- 폴더 / 스캔 ----------
