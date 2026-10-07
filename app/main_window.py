@@ -353,6 +353,11 @@ class MainWindow(QMainWindow):
             _menu_item(menu, "📋 파일 경로 복사",
                        lambda: QGuiApplication.clipboard().setText(path))
 
+        ex = getattr(self, "_vv_exclude", None)
+        if ex is not None:
+            menu.addSeparator()
+            _menu_item(menu, "🚫 이 영상이 있는 폴더 제외 (숨기기)", lambda: ex(self.selected_videos()))
+
         dt = getattr(self, "_vv_delete", None)
         if dt is not None:
             menu.addSeparator()

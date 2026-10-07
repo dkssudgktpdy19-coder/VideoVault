@@ -89,6 +89,9 @@ def main():
     hover_preview.install(window)
     from app import manage
     manage.install(window)
+    from app import folders
+    folders.install(window)
+
 
 
 

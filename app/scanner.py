@@ -4,7 +4,7 @@ import sys
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
-from app import media
+from app import library, media
 from app.config import THUMB_DIR, VIDEO_EXTS
 from app.db import init_db
 from app.drives import drive_letters, get_or_create_drive
@@ -35,9 +35,19 @@ def _progress(done, total):
         print()
 
 
-def _walk(root, skipped):
+def _is_excluded(rel, excl):
+    r = os.path.normcase(rel)
+    return any(r.startswith(e) for e in excl)
+
+
+def _walk(root, skipped, drive_root=None, excl=()):
+    if excl and drive_root and _is_excluded(os.path.relpath(root, drive_root) + os.sep, excl):
+        return                                   # 폴더 자체가 제외됨
     for dirpath, dirnames, filenames in os.walk(root):
-        dirnames[:] = [d for d in dirnames if d not in SKIP_DIRS and not d.startswith(".")]
+        dirnames[:] = [d for d in dirnames
+                       if d not in SKIP_DIRS and not d.startswith(".")
+                       and not (excl and _is_excluded(
+                           os.path.relpath(os.path.join(dirpath, d), drive_root) + os.sep, excl))]
         for name in filenames:
             if os.path.splitext(name)[1].lower() not in VIDEO_EXTS:
                 continue
@@ -46,6 +56,7 @@ def _walk(root, skipped):
                 skipped.append(full)
                 continue
             yield full
+
 
 
 def _analyze(full, size):
@@ -76,7 +87,7 @@ def _save(conn, letters, drive_id, rel, size, mtime, key, info):
         if not old_exists:
             # 이름 변경 또는 이동 → 기존 태그·별점 그대로 유지
             conn.execute("UPDATE videos SET drive_id=?, rel_path=?, filename=?, size=?, mtime=?, "
-                         "is_missing=0 WHERE id=?", (drive_id, rel, filename, size, mtime, same["id"]))
+                         "is_missing=0, excluded=0 WHERE id=?", (drive_id, rel, filename, size, mtime, same["id"]))
             return "moved"
         key = _unique_key(conn, key)   # 같은 파일이 두 군데 있음 → 복사본으로 따로 등록
 
@@ -155,13 +166,16 @@ def scan_folder(folder):
     root = letter + "\\"
     prefix = os.path.relpath(folder, root)
     prefix = "" if prefix == "." else prefix + os.sep
+    library.ensure_excluded(conn)
+    excl = library.excluded_rels(conn, drive_id)
+
 
     # 1) 파일 목록 확인 (바뀐 것만 골라냄)
     print(f"[1/3] 파일 목록 확인 중: {safe_text(folder)}")
     known = {r["rel_path"]: r for r in conn.execute(
         "SELECT id, rel_path, size, mtime, is_missing FROM videos WHERE drive_id=?", (drive_id,))}
     seen, todo, unchanged, skipped = set(), [], 0, []
-    for full in _walk(folder, skipped):
+    for full in _walk(folder, skipped, root, excl):
         rel = os.path.relpath(full, root)
         try:
             st = os.stat(full)
@@ -208,7 +222,7 @@ def scan_folder(folder):
     # 사라진 파일 표시
     missing = 0
     for rel, row in known.items():
-        if rel.startswith(prefix) and rel not in seen:
+        if rel.startswith(prefix) and rel not in seen and not _is_excluded(rel, excl):
             cur = conn.execute("UPDATE videos SET is_missing=1 "
                                "WHERE id=? AND drive_id=? AND rel_path=? AND is_missing=0",
                                (row["id"], drive_id, rel))

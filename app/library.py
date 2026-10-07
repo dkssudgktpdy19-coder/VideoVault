@@ -34,6 +34,47 @@ TEXT_SQL = (
     "           WHERE va.video_id = v.id AND (a.name LIKE ? OR IFNULL(a.aliases,'') LIKE ?)))"
 )
 
+# ---------- 제외 폴더 (#2) ----------
+def ensure_excluded(conn):
+    """videos 표에 '제외' 칸이 없으면 만듦 (기존 기록은 그대로)"""
+    cols = [r[1] for r in conn.execute("PRAGMA table_info(videos)")]
+    if "excluded" not in cols:
+        conn.execute("ALTER TABLE videos ADD COLUMN excluded INTEGER DEFAULT 0")
+        conn.commit()
+
+
+def folder_video_ids(conn, serial, prefix):
+    """특정 드라이브·폴더 안에 있는 영상 id 목록"""
+    row = conn.execute("SELECT id FROM drives WHERE serial = ?", (serial,)).fetchone()
+    if not row:
+        return []
+    p = os.path.normcase(prefix.rstrip("\\/") + os.sep) if prefix else ""
+    return [r["id"] for r in conn.execute("SELECT id, rel_path FROM videos WHERE drive_id = ?", (row["id"],))
+            if os.path.normcase(r["rel_path"]).startswith(p)]
+
+
+def set_excluded_flag(conn, serial, prefix, flag):
+    ensure_excluded(conn)
+    ids = folder_video_ids(conn, serial, prefix)
+    conn.executemany("UPDATE videos SET excluded = ? WHERE id = ?", [(flag, i) for i in ids])
+    conn.commit()
+    return len(ids)
+
+
+def excluded_rels(conn, drive_id):
+    """스캐너용: 이 드라이브에서 제외할 폴더 경로(드라이브 문자 뺀 것) 목록"""
+    row = conn.execute("SELECT serial FROM drives WHERE id = ?", (drive_id,)).fetchone()
+    if not row:
+        return []
+    out = []
+    for x in get_setting(conn, "excluded", []):
+        if x.get("serial") == row["serial"]:
+            p = x.get("prefix") or ""
+            out.append(os.path.normcase(p.rstrip("\\/") + os.sep) if p else "")
+    return out
+
+
+
 
 def _attach_paths(conn, rows):
     """지금 연결된 드라이브 문자로 실제 경로를 붙임 + 자막 있는지 표시"""
@@ -53,7 +94,8 @@ def _attach_paths(conn, rows):
 
 def load_videos(conn, text="", sort="추가된 순 (최신)", only_new=False,
                 tag_ids=(), actor_ids=(), untagged=False):
-    where, params = [], []
+    ensure_excluded(conn)
+    where, params = ["IFNULL(v.excluded, 0) = 0"], []
     for word in text.split():
         where.append(TEXT_SQL)
         params += [f"%{word}%"] * 6
@@ -82,7 +124,9 @@ def get_video(conn, vid):
 
 
 def counts(conn):
-    r = conn.execute("SELECT COUNT(*), IFNULL(SUM(is_new), 0) FROM videos").fetchone()
+    ensure_excluded(conn)
+    r = conn.execute("SELECT COUNT(*), IFNULL(SUM(is_new), 0) FROM videos "
+                     "WHERE IFNULL(excluded, 0) = 0").fetchone()
     return r[0], r[1]
 
 
