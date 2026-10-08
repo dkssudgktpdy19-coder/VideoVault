@@ -72,6 +72,8 @@ def main():
     locale.setlocale(locale.LC_NUMERIC, "C")   # mpv 필수 설정
     apply_dark_theme(app)
     window = MainWindow()
+    from app import toolbar_menu
+    toolbar_menu.snapshot(window)
     quick_exit.install(window)
     from app import style
     style.apply()
@@ -93,13 +95,9 @@ def main():
     folders.install(window)
     from app import actor_ui
     actor_ui.install(window)
-
-
-
-
-
-
-
+    from app import dup_ui
+    dup_ui.install(window)
+    toolbar_menu.install(window)
 
     window.show()
     sys.exit(app.exec())
