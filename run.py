@@ -97,6 +97,8 @@ def main():
     actor_ui.install(window)
     from app import dup_ui
     dup_ui.install(window)
+    from app import merge_ui
+    merge_ui.install(window)
     toolbar_menu.install(window)
 
     window.show()
